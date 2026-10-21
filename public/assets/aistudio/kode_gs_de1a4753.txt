@@ -1,0 +1,2660 @@
+// ═══ SISTEM INFORMASI CUTI ASN — CABDIN MALANG — v7.2 AURORA (BUGFIX & SYNC) ═══
+// Versi Diperbarui: Sinkronisasi Akurat Tanggal Pengajuan & Database Verifikasi
+
+var CONFIG = {
+  SPREADSHEET_ID: '1djPc_54LiLywARvMi2XAqiL0AafrLGe56NAO1gdWhVA',
+  FOLDER_DRIVE_ID: '1PhM30YqJfqIdbcSeQgjlX6etVwCCROBb',
+  CALENDAR_ID: 'primary',
+  TIMEZONE: 'Asia/Jakarta',
+  MAX_FILE_SIZE: 5 * 1024 * 1024,
+  CACHE_TTL_SECONDS: 300,
+  RETRY_MAX_ATTEMPTS: 3,
+  RETRY_BASE_DELAY_MS: 1000,
+  CIRCUIT_BREAKER_THRESHOLD: 5,
+  CIRCUIT_BREAKER_TIMEOUT_MS: 60000,
+  BATCH_SIZE: 50,
+  PAGINATION_SIZE: 25,
+  BULK_UPLOAD_MAX_ROWS: 500,
+  BULK_UPLOAD_MAX_SIZE: 2 * 1024 * 1024,
+  SHEETS: {
+    DB: 'Database_Cuti',
+    REKAP: 'Rekap_Cuti',
+    SEKOLAH: 'Data_Sekolah',
+    DOKUMEN: 'Dokumen_Cuti',
+    USERS: 'Data_Users',
+    GURU: 'Data_Guru',
+    NOTIF: 'Notifikasi_Log',
+    AUDIT: 'Audit_Log',
+    LAPORAN: 'Laporan_Log',
+    QUEUE: 'Notification_Queue',
+    STATUS_HISTORY: 'Status_History',
+    CALENDAR: 'Calendar_Events'
+  },
+  TOTAL_KOLOM_DB: 22,
+  STATUS: {
+    MENUNGGU: 'Menunggu Verifikasi',
+    DISETUJUI: 'Disetujui',
+    DITOLAK: 'Ditolak',
+    REVISI: 'Perlu Revisi'
+  },
+  STATUS_TRANSITIONS: {
+    'Menunggu Verifikasi': ['Disetujui', 'Ditolak', 'Perlu Revisi'],
+    'Perlu Revisi': ['Menunggu Verifikasi', 'Disetujui', 'Ditolak'],
+    'Disetujui': [],
+    'Ditolak': ['Menunggu Verifikasi']
+  },
+  CUTI_TAHUNAN: 'Cuti Tahunan',
+  LOCK_TIMEOUT_MS: 10000,
+  NOTIF_DEFAULTS: {
+    emailAktif: true,
+    emailAdmin: 'imamrohadi2024@gmail.com',
+    waGateway: 'fonnte',
+    fonnteToken: 'qsoe96zuTZo9BNbQ8uqo1oTPq',
+    fonnteUrl: 'https://api.fonnte.com/send',
+    waAdmin: '6282143932039'
+  }
+};
+
+var HARI_LIBUR = [
+  '2026-01-01', '2026-02-17', '2026-03-19', '2026-03-20', '2026-03-21',
+  '2026-04-03', '2026-05-01', '2026-05-14', '2026-05-27', '2026-05-31',
+  '2026-06-01', '2026-06-16', '2026-08-17', '2026-08-25', '2026-12-25'
+];
+
+var MIME_DIIZINKAN = [
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+];
+
+function getHariLibur() {
+  return HARI_LIBUR;
+}
+
+// ═══ PROPERTIES & CACHE VERSIONING ═══
+function getCacheVersion() {
+  return Number(PropertiesService.getScriptProperties().getProperty('CACHE_VERSION') || '1');
+}
+
+function bumpCacheVersion() {
+  var p = PropertiesService.getScriptProperties();
+  var v = Number(p.getProperty('CACHE_VERSION') || '1') + 1;
+  p.setProperty('CACHE_VERSION', String(v));
+}
+
+function setupKeamanan() {
+  var p = PropertiesService.getScriptProperties();
+  var d = {
+    'EMAIL_AKTIF': 'true',
+    'EMAIL_ADMIN': 'imamrohadi2024@gmail.com',
+    'WA_GATEWAY': 'fonnte',
+    'FONNTE_TOKEN': 'qsoe96zuTZo9BNbQ8uqo1oTPq',
+    'FONNTE_URL': 'https://api.fonnte.com/send',
+    'WA_ADMIN': '6282143932039',
+    'LOGIN_MAX_ATTEMPT': '5',
+    'LOGIN_LOCK_MINUTES': '15',
+    'CACHE_ENABLED': 'true',
+    'MAINTENANCE_MODE': 'false',
+    'CACHE_VERSION': '1'
+  };
+  Object.keys(d).forEach(function(k) {
+    if (!p.getProperty(k)) p.setProperty(k, d[k]);
+  });
+}
+
+function getNotifConfig() {
+  try {
+    var p = PropertiesService.getScriptProperties();
+    return {
+      emailAktif: (p.getProperty('EMAIL_AKTIF') || 'true') === 'true',
+      emailAdmin: p.getProperty('EMAIL_ADMIN') || CONFIG.NOTIF_DEFAULTS.emailAdmin,
+      waGateway: p.getProperty('WA_GATEWAY') || CONFIG.NOTIF_DEFAULTS.waGateway,
+      fonnteToken: p.getProperty('FONNTE_TOKEN') || CONFIG.NOTIF_DEFAULTS.fonnteToken,
+      fonnteUrl: p.getProperty('FONNTE_URL') || CONFIG.NOTIF_DEFAULTS.fonnteUrl,
+      waAdmin: p.getProperty('WA_ADMIN') || CONFIG.NOTIF_DEFAULTS.waAdmin
+    };
+  } catch (e) {
+    return CONFIG.NOTIF_DEFAULTS;
+  }
+}
+
+function getAppConfig() {
+  var p = PropertiesService.getScriptProperties();
+  return {
+    loginMaxAttempt: Number(p.getProperty('LOGIN_MAX_ATTEMPT') || 5),
+    loginLockMinutes: Number(p.getProperty('LOGIN_LOCK_MINUTES') || 15),
+    cacheEnabled: (p.getProperty('CACHE_ENABLED') || 'true') === 'true',
+    maintenanceMode: (p.getProperty('MAINTENANCE_MODE') || 'false') === 'true'
+  };
+}
+
+// ═══ ERROR HANDLING ═══
+var ERR = {
+  VALIDATION: 'VALIDATION',
+  NOT_FOUND: 'NOT_FOUND',
+  DUPLICATE: 'DUPLICATE',
+  FORBIDDEN: 'FORBIDDEN',
+  SYSTEM: 'SYSTEM',
+  TIMEOUT: 'TIMEOUT',
+  RATE_LIMIT: 'RATE_LIMIT',
+  CIRCUIT_OPEN: 'CIRCUIT_OPEN'
+};
+
+function buatError(category, message, detail) {
+  var e = new Error(message);
+  e.category = category;
+  e.detail = detail || '';
+  e.timestamp = new Date().toISOString();
+  return e;
+}
+
+var ErrorHandler = {
+  wrap: function(context, fn, opts) {
+    opts = opts || {};
+    var t0 = new Date().getTime();
+    try {
+      var r = fn();
+      PerformanceLogger.log(context, new Date().getTime() - t0, 'SUCCESS');
+      return r;
+    } catch (e) {
+      PerformanceLogger.log(context, new Date().getTime() - t0, 'ERROR');
+      ErrorHandler.log(context, e);
+      var pesan = ErrorHandler.pesanUntukUser(e);
+      if (opts.returnArray) return [];
+      if (opts.returnObject) return {};
+      return { success: false, message: pesan, category: e.category || ERR.SYSTEM };
+    }
+  },
+  wrapArray: function(c, f) { return ErrorHandler.wrap(c, f, { returnArray: true }); },
+  wrapObject: function(c, f) { return ErrorHandler.wrap(c, f, { returnObject: true }); },
+  pesanUntukUser: function(e) {
+    if (!e) return 'Terjadi kesalahan sistem.';
+    var c = e.category || ERR.SYSTEM;
+    if (c === ERR.VALIDATION || c === ERR.NOT_FOUND || c === ERR.DUPLICATE ||
+        c === ERR.FORBIDDEN || c === ERR.RATE_LIMIT) return e.message;
+    if (c === ERR.TIMEOUT) return 'Operasi terlalu lama. Silakan coba lagi.';
+    if (c === ERR.CIRCUIT_OPEN) return 'Layanan sedang dalam pemulihan.';
+    return 'Terjadi kesalahan sistem. Silakan coba lagi.';
+  },
+  log: function(context, e) {
+    console.error('[ERROR][' + context + '] ' + (e.category || '?') + ': ' + (e.message || e));
+    try {
+      var ss = Repo.getSpreadsheet();
+      var sh = ss.getSheetByName(CONFIG.SHEETS.AUDIT);
+      if (!sh) {
+        sh = ss.insertSheet(CONFIG.SHEETS.AUDIT);
+        sh.getRange(1, 1, 1, 6).setValues([['Timestamp', 'Konteks', 'Kategori', 'Pesan', 'Detail', 'Stack']])
+          .setFontWeight('bold').setBackground('#c0392b').setFontColor('#fff');
+      }
+      sh.appendRow([
+        Utils.formatTimestampDetik(), context, e.category || 'UNKNOWN',
+        String(e.message || '').substring(0, 500),
+        String(e.detail || '').substring(0, 1000),
+        String(e.stack || '').substring(0, 2000)
+      ]);
+    } catch (x) {}
+  },
+  wajib: function(value, namaField) {
+    if (value === null || value === undefined || String(value).trim() === '') {
+      throw buatError(ERR.VALIDATION, namaField + ' wajib diisi.');
+    }
+    return String(value).trim();
+  }
+};
+
+// ═══ RETRY & CIRCUIT BREAKER ═══
+var RetryService = {
+  execute: function(fn, context, maxAttempts) {
+    maxAttempts = maxAttempts || CONFIG.RETRY_MAX_ATTEMPTS;
+    var lastError = null;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try { return fn(); }
+      catch (e) {
+        lastError = e;
+        console.warn('[RETRY][' + context + '] ' + attempt + '/' + maxAttempts + ' gagal: ' + e.message);
+        if (attempt < maxAttempts) Utilities.sleep(CONFIG.RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+      }
+    }
+    throw buatError(ERR.SYSTEM, 'Operasi gagal setelah ' + maxAttempts + ' percobaan: ' + lastError.message, context);
+  }
+};
+
+var CircuitBreaker = {
+  getState: function(s) {
+    var c = CacheService.getScriptCache();
+    var st = c.get('cb_' + s);
+    return st ? JSON.parse(st) : { failures: 0, isOpen: false, lastFailure: null };
+  },
+  setState: function(s, st) {
+    CacheService.getScriptCache().put('cb_' + s, JSON.stringify(st), 3600);
+  },
+  execute: function(s, fn) {
+    var st = CircuitBreaker.getState(s);
+    if (st.isOpen) {
+      if (new Date().getTime() - st.lastFailure < CONFIG.CIRCUIT_BREAKER_TIMEOUT_MS) {
+        throw buatError(ERR.CIRCUIT_OPEN, 'Layanan ' + s + ' sedang dalam recovery.');
+      }
+      st.isOpen = false; st.failures = 0;
+    }
+    try {
+      var r = fn();
+      st.failures = 0;
+      CircuitBreaker.setState(s, st);
+      return r;
+    } catch (e) {
+      st.failures++;
+      st.lastFailure = new Date().getTime();
+      if (st.failures >= CONFIG.CIRCUIT_BREAKER_THRESHOLD) {
+        st.isOpen = true;
+        console.error('[CIRCUIT_BREAKER] ' + s + ' opened');
+      }
+      CircuitBreaker.setState(s, st);
+      throw e;
+    }
+  }
+};
+
+var PerformanceLogger = {
+  log: function(ctx, ms, status) {
+    if (ms > 5000) console.warn('[PERF_SLOW][' + ctx + '] ' + ms + 'ms');
+    try {
+      var c = CacheService.getScriptCache();
+      var k = 'perf_' + ctx;
+      var ex = JSON.parse(c.get(k) || '{"count":0,"totalMs":0,"maxMs":0}');
+      ex.count++; ex.totalMs += ms; ex.maxMs = Math.max(ex.maxMs, ms);
+      ex.lastStatus = status; ex.lastRun = new Date().toISOString();
+      c.put(k, JSON.stringify(ex), 86400);
+    } catch (e) {}
+  },
+  getStats: function(ctx) {
+    try {
+      var d = JSON.parse(CacheService.getScriptCache().get('perf_' + ctx) || '{}');
+      if (d.count > 0) d.avgMs = Math.round(d.totalMs / d.count);
+      return d;
+    } catch (e) { return {}; }
+  }
+};
+
+// ═══ UTILS (DIPERBAIKI: ZONA WAKTU & FORMAT TANGGAL AKURAT) ═══
+var Utils = {
+  escapeHtml: function(t) {
+    return String(t == null ? '' : t)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  },
+
+  // Mengembalikan format dd-MM-yyyy WIB konsisten
+  formatTanggalPengajuan: function() {
+    return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd-MM-yyyy');
+  },
+
+  formatTimestamp: function() {
+    return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd-MM-yyyy HH:mm');
+  },
+
+  formatTimestampDetik: function() {
+    return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd-MM-yyyy HH:mm:ss');
+  },
+
+  isValidDateParts: function(y, m, d) {
+    y = Number(y); m = Number(m); d = Number(d);
+    if (!y || !m || !d || m < 1 || m > 12 || d < 1 || d > 31) return false;
+    var dt = new Date(y, m - 1, d);
+    return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
+  },
+
+  // Parsing tanggal tahan segala format (Date object, UTC ISO cache string, dd-MM-yyyy, d/m/yyyy, yyyy-mm-dd)
+  parseTanggalAman: function(v) {
+    if (v === null || v === undefined || v === '') return null;
+    
+    // Kasus 1: Objek Date asli dari getValues()
+    if (v instanceof Date) {
+      if (isNaN(v.getTime())) return null;
+      try {
+        var sIso = Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+        var parts = sIso.split('-');
+        return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+      } catch (e) {
+        return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+      }
+    }
+
+    var s = String(v).trim();
+    if (!s) return null;
+
+    // Kasus 2: String ISO 8601 dari JSON.stringify cache (contoh: "2026-10-18T17:00:00.000Z")
+    // PENTING: Harus dikonversi ke zona waktu Asia/Jakarta (WIB) agar tidak mundur 1 hari!
+    if (/^\d{4}-\d{2}-\d{2}T/.test(s) || /Z$/.test(s)) {
+      var dUtc = new Date(s);
+      if (!isNaN(dUtc.getTime())) {
+        var sWib = Utilities.formatDate(dUtc, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+        var partsWib = sWib.split('-');
+        return new Date(Number(partsWib[0]), Number(partsWib[1]) - 1, Number(partsWib[2]));
+      }
+    }
+
+    // Kasus 3: dd-MM-yyyy (format standar aplikasi)
+    var m1 = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+    if (m1) {
+      if (!Utils.isValidDateParts(m1[3], m1[2], m1[1])) return null;
+      return new Date(Number(m1[3]), Number(m1[2]) - 1, Number(m1[1]));
+    }
+
+    // Kasus 4: dd/MM/yyyy atau MM/dd/yyyy
+    var m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (m2) {
+      if (!Utils.isValidDateParts(m2[3], m2[2], m2[1])) return null;
+      return new Date(Number(m2[3]), Number(m2[2]) - 1, Number(m2[1]));
+    }
+
+    // Kasus 5: yyyy-MM-dd MURNI (tanpa komponen waktu T)
+    var m3 = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m3) {
+      if (!Utils.isValidDateParts(m3[1], m3[2], m3[3])) return null;
+      return new Date(Number(m3[1]), Number(m3[2]) - 1, Number(m3[3]));
+    }
+
+    var d = new Date(s);
+    return isNaN(d.getTime()) ? null : new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  },
+
+  // Format ke "dd-MM-yyyy" yang selalu akurat dan sinkron dengan Database
+  fmtTanggal: function(v) {
+    if (v === null || v === undefined || v === '') return '-';
+    try {
+      // 1. Objek Date
+      if (v instanceof Date && !isNaN(v.getTime())) {
+        return Utilities.formatDate(v, CONFIG.TIMEZONE, 'dd-MM-yyyy');
+      }
+
+      var s = String(v).trim();
+      if (!s) return '-';
+
+      // 2. Jika sudah berformat dd-MM-yyyy murni
+      if (/^\d{2}-\d{2}-\d{4}$/.test(s)) return s;
+      var mStrip = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+      if (mStrip) {
+        return String(mStrip[1]).padStart(2, '0') + '-' + String(mStrip[2]).padStart(2, '0') + '-' + mStrip[3];
+      }
+
+      // 3. String ISO 8601 (Cache hasil JSON.stringify)
+      if (/^\d{4}-\d{2}-\d{2}T/.test(s) || /Z$/.test(s)) {
+        var dUtc = new Date(s);
+        if (!isNaN(dUtc.getTime())) {
+          return Utilities.formatDate(dUtc, CONFIG.TIMEZONE, 'dd-MM-yyyy');
+        }
+      }
+
+      // 4. Format slash: d/m/yyyy
+      var mSlash = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+      if (mSlash) {
+        return String(mSlash[1]).padStart(2, '0') + '-' + String(mSlash[2]).padStart(2, '0') + '-' + mSlash[3];
+      }
+
+      // 5. Format yyyy-mm-dd murni
+      var mIso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (mIso) {
+        return String(mIso[3]).padStart(2, '0') + '-' + String(mIso[2]).padStart(2, '0') + '-' + mIso[1];
+      }
+
+      // Fallback menggunakan parser aman
+      var d = Utils.parseTanggalAman(v);
+      if (d) {
+        return String(d.getDate()).padStart(2, '0') + '-' +
+               String(d.getMonth() + 1).padStart(2, '0') + '-' + d.getFullYear();
+      }
+      return s;
+    } catch (e) {
+      return String(v);
+    }
+  },
+
+  formatFileSize: function(b) {
+    b = Number(b) || 0;
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1048576).toFixed(2) + ' MB';
+  },
+
+  isValidEmail: function(e) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || '').trim());
+  },
+
+  normalisasiNomor: function(n) {
+    n = String(n || '').replace(/\D/g, '');
+    if (!n) return '';
+    if (n.charAt(0) === '0') n = '62' + n.substring(1);
+    else if (n.charAt(0) === '8') n = '62' + n;
+    return n.length >= 9 ? n : '';
+  },
+
+  nipClean: function(n) {
+    return String(n || '').replace(/\s+/g, '').trim();
+  },
+
+  sanitizeFilename: function(n) {
+    return String(n || 'file').replace(/[/?%*:|"<>]/g, '_');
+  },
+
+  sanitizeInput: function(i) {
+    return String(i || '').replace(/[<>"']/g, '').trim().substring(0, 1000);
+  },
+
+  toISOTanggal: function(v) {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    }
+    var d = Utils.parseTanggalAman(v);
+    if (!d) return '';
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  },
+
+  getTahunDariTanggal: function(v) {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+      return Number(Utilities.formatDate(v, CONFIG.TIMEZONE, 'yyyy'));
+    }
+    var d = Utils.parseTanggalAman(v);
+    return d ? d.getFullYear() : null;
+  },
+
+  hitungHariKerja: function(mulai, selesai) {
+    var d1 = Utils.parseTanggalAman(mulai), d2 = Utils.parseTanggalAman(selesai);
+    if (!d1 || !d2 || d2 < d1) return 0;
+    var libur = {};
+    HARI_LIBUR.forEach(function(t) { libur[t] = true; });
+    var jml = 0;
+    var d = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate());
+    var end = new Date(d2.getFullYear(), d2.getMonth(), d2.getDate());
+    while (d <= end) {
+      var h = d.getDay();
+      var k = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+      if (h !== 0 && h !== 6 && !libur[k]) jml++;
+      d.setDate(d.getDate() + 1);
+    }
+    return jml;
+  },
+
+  buatWaLink: function(n, p) {
+    return n ? 'https://wa.me/' + n + '?text=' + encodeURIComponent(p) : '';
+  },
+
+  hashPassword: function(pw, salt) {
+    var dig = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(salt || '') + String(pw || ''), Utilities.Charset.UTF_8);
+    return dig.map(function(b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
+  },
+
+  generateSalt: function() { return Utilities.getUuid().replace(/-/g, '').substring(0, 16); },
+  generateId: function() { return Utilities.getUuid().replace(/-/g, '').substring(0, 12); },
+
+  validasiFile: function(fd) {
+    if (fd.fileSize > CONFIG.MAX_FILE_SIZE) return { valid: false, message: 'Ukuran file melebihi 5 MB.' };
+    if (MIME_DIIZINKAN.indexOf(fd.fileType) === -1) return { valid: false, message: 'Tipe file tidak diizinkan.' };
+    var ext = String(fd.fileName || '').toLowerCase().split('.').pop();
+    if (['pdf', 'jpg', 'jpeg', 'png', 'doc', 'docx'].indexOf(ext) === -1) return { valid: false, message: 'Ekstensi file tidak diizinkan.' };
+    return { valid: true, message: 'OK' };
+  },
+
+  getBulanNama: function(b) {
+    var n = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+    return n[b] || '';
+  }
+};
+
+// ═══ REPOSITORY ═══
+var Repo = {
+  getSpreadsheet: function() { return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID); },
+  getSheet: function(n) { return Repo.getSpreadsheet().getSheetByName(n); },
+
+  bacaData: function(sn, nc) {
+    var version = getCacheVersion();
+    var key = 'v' + version + '_data_' + sn + '_' + nc;
+    var cfg = getAppConfig();
+    if (cfg.cacheEnabled) {
+      try {
+        var c = CacheService.getScriptCache().get(key);
+        if (c) return JSON.parse(c);
+      } catch (e) {}
+    }
+    var sh = Repo.getSheet(sn);
+    if (!sh || sh.getLastRow() < 2) return [];
+    var cols = Math.min(sh.getMaxColumns(), nc);
+    if (cols <= 0) return [];
+    var data = sh.getRange(2, 1, sh.getLastRow() - 1, cols).getValues();
+    if (cfg.cacheEnabled) {
+      try {
+        CacheService.getScriptCache().put(key, JSON.stringify(data), CONFIG.CACHE_TTL_SECONDS);
+      } catch (e) {}
+    }
+    return data;
+  },
+
+  appendRow: function(sn, row) {
+    var sh = Repo.getSheet(sn);
+    if (!sh) throw buatError(ERR.SYSTEM, 'Sheet "' + sn + '" tidak ditemukan.');
+    sh.appendRow(row);
+    bumpCacheVersion();
+    return sh.getLastRow();
+  },
+
+  batchAppendRows: function(sn, rows) {
+    if (!rows || !rows.length) return;
+    var sh = Repo.getSheet(sn);
+    if (!sh) throw buatError(ERR.SYSTEM, 'Sheet "' + sn + '" tidak ditemukan.');
+    var s = sh.getLastRow() + 1;
+    sh.getRange(s, 1, rows.length, rows[0].length).setValues(rows);
+    bumpCacheVersion();
+    return s + rows.length - 1;
+  },
+
+  updateCell: function(sn, r, c, v) {
+    var sh = Repo.getSheet(sn);
+    if (sh) { sh.getRange(r, c).setValue(v); bumpCacheVersion(); }
+  },
+
+  batchUpdateCells: function(sn, ups) {
+    var sh = Repo.getSheet(sn);
+    if (!sh) return;
+    ups.forEach(function(u) { sh.getRange(u.row, u.col).setValue(u.value); });
+    bumpCacheVersion();
+  },
+
+  hapusBaris: function(sn, r) {
+    var sh = Repo.getSheet(sn);
+    if (sh) { sh.deleteRow(r); bumpCacheVersion(); }
+  },
+
+  getNextNo: function(sn) {
+    var lock = LockService.getScriptLock();
+    try {
+      lock.tryLock(CONFIG.LOCK_TIMEOUT_MS);
+      var sh = Repo.getSheet(sn);
+      if (!sh || sh.getLastRow() < 2) return 1;
+      var vals = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues(), max = 0;
+      vals.forEach(function(r) { var n = Number(r[0]); if (!isNaN(n) && n > max) max = n; });
+      return max + 1;
+    } finally { try { lock.releaseLock(); } catch (e) {} }
+  },
+
+  ensureMinColumns: function(sn, n) {
+    var sh = Repo.getSheet(sn);
+    if (!sh) return;
+    if (sh.getMaxColumns() < n) sh.insertColumnsAfter(sh.getMaxColumns(), n - sh.getMaxColumns());
+  },
+
+  ensureSemuaHeader: function() {
+    var sh = Repo.getSheet(CONFIG.SHEETS.DB); if (!sh) return;
+    Repo.ensureMinColumns(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+    var h = sh.getRange(1, 1, 1, CONFIG.TOTAL_KOLOM_DB).getValues()[0];
+    var wajib = [
+      'No', 'Tanggal', 'NIP', 'Nama', 'Jabatan', 'Unit Kerja',
+      'Jenis Cuti', 'Alasan', 'Tgl Mulai', 'Tgl Selesai', 'Lama (Hari)',
+      'Alamat', 'No HP', 'Status Kepegawaian', 'Status', 'Catatan',
+      'Atasan Langsung', 'NIP Atasan Langsung', 'Tgl Verifikasi',
+      'Verifikator', 'Email Pemohon', 'Calendar Event ID'
+    ];
+    var ubah = false;
+    for (var i = 0; i < wajib.length; i++) {
+      if (!h[i] || String(h[i]).trim() === '') { h[i] = wajib[i]; ubah = true; }
+    }
+    if (ubah) {
+      sh.getRange(1, 1, 1, CONFIG.TOTAL_KOLOM_DB).setValues([h])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+  },
+
+  // Pastikan format teks murni (@) secara aman tanpa memblokir saat sheet sedang dibuka/diedit
+  ensureTextFormatNip: function() {
+    try {
+      var ss = Repo.getSpreadsheet();
+      [
+        { n: CONFIG.SHEETS.GURU, c: 1 },    // NIP Guru
+        { n: CONFIG.SHEETS.DB, c: 2 },      // Tanggal Pengajuan
+        { n: CONFIG.SHEETS.DB, c: 3 },      // NIP Pemohon
+        { n: CONFIG.SHEETS.DB, c: 9 },      // Tgl Mulai
+        { n: CONFIG.SHEETS.DB, c: 10 },     // Tgl Selesai
+        { n: CONFIG.SHEETS.DOKUMEN, c: 3 }  // NIP Dokumen
+      ].forEach(function(t) {
+        try {
+          var s = ss.getSheetByName(t.n);
+          if (!s) return;
+          var lastRow = s.getLastRow();
+          if (lastRow >= 2) {
+            // Format hanya baris data (baris 2 ke bawah), tidak menyentuh header atau sel kosong
+            s.getRange(2, t.c, lastRow - 1, 1).setNumberFormat('@');
+          }
+        } catch (eCol) {
+          // Dilewati dengan aman jika ada sel/kolom yang sedang aktif diedit di browser
+          console.warn('ensureTextFormatNip dilewati untuk kolom ' + t.c + ' sheet ' + t.n + ': ' + eCol.message);
+        }
+      });
+    } catch (e) {
+      console.warn('ensureTextFormatNip global warning: ' + e.toString());
+    }
+  },
+
+  inisialisasiDatabase: function() {
+    var ss = Repo.getSpreadsheet();
+    if (!ss.getSheetByName(CONFIG.SHEETS.USERS)) {
+      var s1 = ss.insertSheet(CONFIG.SHEETS.USERS);
+      s1.getRange(1, 1, 1, 5).setValues([['Username', 'Password', 'Role', 'Nama Lengkap', 'Salt']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+      var salt = Utils.generateSalt();
+      s1.getRange(2, 1, 1, 5).setValues([['cabdinmalang', Utils.hashPassword('admin', salt), 'cabdin', 'Admin Cabang Dinas', salt]]);
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.DB)) {
+      var s2 = ss.insertSheet(CONFIG.SHEETS.DB);
+      s2.getRange(1, 1, 1, CONFIG.TOTAL_KOLOM_DB).setValues([[
+        'No', 'Tanggal', 'NIP', 'Nama', 'Jabatan', 'Unit Kerja',
+        'Jenis Cuti', 'Alasan', 'Tgl Mulai', 'Tgl Selesai', 'Lama (Hari)',
+        'Alamat', 'No HP', 'Status Kepegawaian', 'Status', 'Catatan',
+        'Atasan Langsung', 'NIP Atasan Langsung', 'Tgl Verifikasi',
+        'Verifikator', 'Email Pemohon', 'Calendar Event ID'
+      ]]).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.REKAP)) {
+      var s3 = ss.insertSheet(CONFIG.SHEETS.REKAP);
+      s3.getRange(1, 1, 1, 4).setValues([['Nama', 'Unit Kerja', 'Sisa Cuti', 'Total Diambil']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.SEKOLAH)) {
+      var s4 = ss.insertSheet(CONFIG.SHEETS.SEKOLAH);
+      s4.getRange(1, 1, 1, 5).setValues([['No', 'NPSN', 'Nama Sekolah', 'Jenjang', 'Kota']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+      var sek = [
+        [1, '20533639', 'SLB A,B,D NEGERI KEDUNGKANDANG KOTA MALANG', 'SLB', 'Kota Malang'],
+        [2, '20533640', 'SLB C AUTIS NEGERI KEDUNGKANDANG KOTA MALANG', 'SLB', 'Kota Malang'],
+        [3, '20539749', 'SLB NEGERI', 'SLB', 'Kota Malang'],
+        [4, '20533639', 'SMA NEGERI 1 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [5, '20533640', 'SMA NEGERI 2 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [6, '20533641', 'SMA NEGERI 3 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [7, '20533642', 'SMA NEGERI 4 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [8, '20533643', 'SMA NEGERI 5 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [9, '20533644', 'SMA NEGERI 6 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [10, '20533645', 'SMA NEGERI 7 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [11, '20533646', 'SMA NEGERI 8 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [12, '20533647', 'SMA NEGERI 9 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [13, '20533648', 'SMA NEGERI 10 KOTA MALANG', 'SMA', 'Kota Malang'],
+        [14, '20533649', 'SMA NEGERI TARUNA NALA JAWA TIMUR', 'SMA', 'Kota Malang'],
+        [15, '20533650', 'SMKN 1 MALANG', 'SMK', 'Kota Malang'],
+        [16, '20533651', 'SMKN 2 MALANG', 'SMK', 'Kota Malang'],
+        [17, '20533652', 'SMKN 3 MALANG', 'SMK', 'Kota Malang'],
+        [18, '20533653', 'SMKN 4 MALANG', 'SMK', 'Kota Malang'],
+        [19, '20533654', 'SMKN 5 MALANG', 'SMK', 'Kota Malang'],
+        [20, '20533655', 'SMKN 6 MALANG', 'SMK', 'Kota Malang'],
+        [21, '20533656', 'SMKN 7 MALANG', 'SMK', 'Kota Malang'],
+        [22, '20533657', 'SMKN 8 MALANG', 'SMK', 'Kota Malang'],
+        [23, '20533658', 'SMKN 9 MALANG', 'SMK', 'Kota Malang'],
+        [24, '20533659', 'SMKN 10 MALANG', 'SMK', 'Kota Malang'],
+        [25, '20533660', 'SMKN 11 MALANG', 'SMK', 'Kota Malang'],
+        [26, '20533661', 'SMKN 12 MALANG', 'SMK', 'Kota Malang'],
+        [27, '20533662', 'SMKN 13 MALANG', 'SMK', 'Kota Malang'],
+        [28, '20533700', 'SMAN 1 BATU', 'SMA', 'Kota Batu'],
+        [29, '20533701', 'SMAN 2 BATU', 'SMA', 'Kota Batu'],
+        [30, '20533702', 'SMAN 3 BATU', 'SMA', 'Kota Batu'],
+        [31, '20533703', 'SMKN 1 BATU', 'SMK', 'Kota Batu'],
+        [32, '20533704', 'SMKN 2 BATU', 'SMK', 'Kota Batu'],
+        [33, '20533705', 'SMKN 3 BATU', 'SMK', 'Kota Batu']
+      ];
+      s4.getRange(2, 1, sek.length, 5).setValues(sek);
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.DOKUMEN)) {
+      var s5 = ss.insertSheet(CONFIG.SHEETS.DOKUMEN);
+      s5.getRange(1, 1, 1, 12).setValues([[
+        'No', 'Tanggal', 'NIP', 'Nama', 'Unit Kerja', 'Jenis Dokumen',
+        'No Pengajuan', 'Nama File', 'Tipe', 'Ukuran', 'Link Drive', 'Keterangan'
+      ]]).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.GURU)) {
+      var s6 = ss.insertSheet(CONFIG.SHEETS.GURU);
+      s6.getRange(1, 1, 1, 6).setValues([['NIP', 'Nama', 'JK', 'Status', 'Gol Ruang', 'Sekolah']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+      s6.setColumnWidth(1, 250); s6.setColumnWidth(2, 350); s6.setColumnWidth(6, 400);
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.QUEUE)) {
+      var s7 = ss.insertSheet(CONFIG.SHEETS.QUEUE);
+      s7.getRange(1, 1, 1, 8).setValues([['ID', 'Timestamp', 'Type', 'Payload', 'Status', 'Attempts', 'LastError', 'CompletedAt']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.LAPORAN)) {
+      var s8 = ss.insertSheet(CONFIG.SHEETS.LAPORAN);
+      s8.getRange(1, 1, 1, 7).setValues([['ID', 'Timestamp', 'Jenis Laporan', 'Parameter', 'GeneratedBy', 'Status', 'Link']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.STATUS_HISTORY)) {
+      var s9 = ss.insertSheet(CONFIG.SHEETS.STATUS_HISTORY);
+      s9.getRange(1, 1, 1, 7).setValues([['ID', 'Timestamp', 'No Pengajuan', 'Status Lama', 'Status Baru', 'Catatan', 'Aktor']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+    if (!ss.getSheetByName(CONFIG.SHEETS.CALENDAR)) {
+      var s10 = ss.insertSheet(CONFIG.SHEETS.CALENDAR);
+      s10.getRange(1, 1, 1, 5).setValues([['ID', 'Timestamp', 'No Pengajuan', 'Event ID', 'Status']])
+        .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    }
+  },
+
+  getRootFolder: function() {
+    if (CONFIG.FOLDER_DRIVE_ID) {
+      try { return DriveApp.getFolderById(CONFIG.FOLDER_DRIVE_ID); }
+      catch (e) { console.error('Folder utama tidak diakses: ' + e.toString()); }
+    }
+    var f = DriveApp.getFoldersByName('Dokumen Cuti ASN');
+    return f.hasNext() ? f.next() : DriveApp.createFolder('Dokumen Cuti ASN');
+  },
+
+  getOrCreateSubFolder: function(p, n) {
+    var f = p.getFoldersByName(n);
+    return f.hasNext() ? f.next() : p.createFolder(n);
+  },
+
+  simpanFileKeDrive: function(blob, folder) {
+    return RetryService.execute(function() {
+      var file = folder.createFile(blob);
+      try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}
+      return { url: file.getUrl(), id: file.getId() };
+    }, 'simpanFileKeDrive');
+  },
+
+  hapusFileDariDrive: function(id) {
+    try {
+      return RetryService.execute(function() {
+        DriveApp.getFileById(id).setTrashed(true);
+        return true;
+      }, 'hapusFileDariDrive');
+    } catch (e) {
+      return false;
+    }
+  }
+};
+
+// ═══ RATE LIMIT LOGIN ═══
+var RateLimit = {
+  isLocked: function(u) {
+    return CacheService.getScriptCache().get('ll_' + String(u).replace(/\s/g, '').toLowerCase()) !== null;
+  },
+  catatGagal: function(u) {
+    var c = CacheService.getScriptCache(), cfg = getAppConfig(), k = String(u).replace(/\s/g, '').toLowerCase();
+    var a = Number(c.get('lc_' + k) || 0) + 1;
+    c.put('lc_' + k, String(a), cfg.loginLockMinutes * 60);
+    if (a >= cfg.loginMaxAttempt) {
+      c.put('ll_' + k, '1', cfg.loginLockMinutes * 60);
+      c.remove('lc_' + k);
+      return true;
+    }
+    return false;
+  },
+  reset: function(u) {
+    var c = CacheService.getScriptCache();
+    var k = String(u).replace(/\s/g, '').toLowerCase();
+    c.remove('lc_' + k);
+    c.remove('ll_' + k);
+  }
+};
+
+// ═══ SERVICES ═══
+var AuthService = {
+  login: function(username, password) {
+    var user = ErrorHandler.wajib(username, 'Username'), pass = ErrorHandler.wajib(password, 'Password');
+    if (RateLimit.isLocked(user)) {
+      throw buatError(ERR.FORBIDDEN, 'Terlalu banyak percobaan. Coba lagi ' + getAppConfig().loginLockMinutes + ' menit.');
+    }
+    var data = Repo.bacaData(CONFIG.SHEETS.USERS, 5);
+    for (var i = 0; i < data.length; i++) {
+      if (String(data[i][0]).trim() === user) {
+        var stored = String(data[i][1]).trim(), salt = String(data[i][4] || '').trim();
+        var cocok = salt ? Utils.hashPassword(pass, salt) === stored : (stored === pass || stored === Utils.hashPassword(pass, ''));
+        if (cocok) {
+          RateLimit.reset(user);
+          return { success: true, role: String(data[i][2]).trim(), nama: String(data[i][3]).trim() };
+        }
+        if (RateLimit.catatGagal(user)) {
+          throw buatError(ERR.FORBIDDEN, 'Terlalu banyak percobaan. Akun dikunci ' + getAppConfig().loginLockMinutes + ' menit.');
+        }
+        throw buatError(ERR.FORBIDDEN, 'Username/Password salah!');
+      }
+    }
+    throw buatError(ERR.FORBIDDEN, 'Username/Password salah!');
+  },
+
+  resetPassword: function(username, passLama, passBaru) {
+    var user = ErrorHandler.wajib(username, 'Username'), pL = ErrorHandler.wajib(passLama, 'Password lama'), pB = ErrorHandler.wajib(passBaru, 'Password baru');
+    if (pB.length < 6) throw buatError(ERR.VALIDATION, 'Password baru minimal 6 karakter.');
+    if (pL === pB) throw buatError(ERR.VALIDATION, 'Password baru tidak boleh sama.');
+    var data = Repo.bacaData(CONFIG.SHEETS.USERS, 5);
+    for (var i = 0; i < data.length; i++) {
+      if (String(data[i][0]).trim() === user) {
+        if (String(data[i][2]).trim() !== 'cabdin') throw buatError(ERR.FORBIDDEN, 'Reset password hanya untuk admin.');
+        var stored = String(data[i][1]).trim(), salt = String(data[i][4] || '').trim();
+        var cocok = salt ? Utils.hashPassword(pL, salt) === stored : (stored === pL || stored === Utils.hashPassword(pL, ''));
+        if (!cocok) throw buatError(ERR.FORBIDDEN, 'Password lama salah.');
+        var ns = Utils.generateSalt();
+        Repo.updateCell(CONFIG.SHEETS.USERS, i + 2, 2, Utils.hashPassword(pB, ns));
+        Repo.updateCell(CONFIG.SHEETS.USERS, i + 2, 5, ns);
+        return { success: true, message: 'Password berhasil diganti. Silakan login ulang.' };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'User tidak ditemukan.');
+  }
+};
+
+var SekolahService = {
+  getDaftar: function() {
+    return Repo.bacaData(CONFIG.SHEETS.SEKOLAH, 5).map(function(r) {
+      return { nama: String(r[2] || '').trim(), jenjang: String(r[3] || '').trim(), kota: String(r[4] || '').trim() };
+    }).filter(function(r) { return r.nama; });
+  }
+};
+
+var GuruService = {
+  getPerSekolah: function() {
+    var grouped = {};
+    Repo.bacaData(CONFIG.SHEETS.GURU, 6).forEach(function(r) {
+      if (!r[0] || !r[1]) return;
+      var sek = String(r[5] || 'Lainnya').trim();
+      if (!grouped[sek]) grouped[sek] = [];
+      grouped[sek].push({
+        nip: String(r[0]).trim(),
+        nama: String(r[1]).trim(),
+        jk: String(r[2] || '-').trim(),
+        status: String(r[3] || '-').trim(),
+        golRuang: String(r[4] || '-').trim()
+      });
+    });
+    Object.keys(grouped).forEach(function(k) {
+      grouped[k].sort(function(a, b) { return String(a.nama).localeCompare(String(b.nama)); });
+    });
+    return grouped;
+  },
+
+  cariByNip: function(nip) {
+    var t = Utils.nipClean(nip);
+    if (!t) throw buatError(ERR.VALIDATION, 'NIP belum diisi.');
+    var data = Repo.bacaData(CONFIG.SHEETS.GURU, 6);
+    for (var i = 0; i < data.length; i++) {
+      if (Utils.nipClean(data[i][0]) === t) {
+        return {
+          success: true,
+          data: {
+            nip: String(data[i][0]),
+            nama: String(data[i][1]),
+            jk: String(data[i][2] || '-'),
+            status: String(data[i][3] || '-'),
+            golRuang: String(data[i][4] || '-'),
+            sekolah: String(data[i][5] || '')
+          }
+        };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'NIP tidak ditemukan dalam database');
+  },
+
+  tambah: function(d) {
+    ErrorHandler.wajib(d.nip, 'NIP'); ErrorHandler.wajib(d.nama, 'Nama'); ErrorHandler.wajib(d.sekolah, 'Sekolah');
+    try {
+      var ex = GuruService.cariByNip(d.nip);
+      if (ex.success) throw buatError(ERR.DUPLICATE, 'NIP ' + d.nip + ' sudah terdaftar atas nama ' + ex.data.nama);
+    } catch (e) { if (e.category === ERR.DUPLICATE) throw e; }
+    Repo.appendRow(CONFIG.SHEETS.GURU, [
+      String(d.nip).trim(), String(d.nama).trim(), String(d.jk || '-').trim(),
+      String(d.status || '-').trim(), String(d.golRuang || '').trim(), String(d.sekolah).trim()
+    ]);
+    return { success: true, message: 'Guru "' + d.nama + '" berhasil ditambahkan' };
+  },
+
+  hapus: function(nip) {
+    var t = Utils.nipClean(nip), data = Repo.bacaData(CONFIG.SHEETS.GURU, 6);
+    for (var i = 0; i < data.length; i++) {
+      if (Utils.nipClean(data[i][0]) === t) {
+        var nama = data[i][1];
+        Repo.hapusBaris(CONFIG.SHEETS.GURU, i + 2);
+        return { success: true, message: 'Guru "' + nama + '" berhasil dihapus' };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'NIP tidak ditemukan');
+  },
+
+  mutasi: function(nip, sekolahBaru) {
+    ErrorHandler.wajib(sekolahBaru, 'Sekolah tujuan');
+    var t = Utils.nipClean(nip), data = Repo.bacaData(CONFIG.SHEETS.GURU, 6);
+    for (var i = 0; i < data.length; i++) {
+      if (Utils.nipClean(data[i][0]) === t) {
+        var nama = data[i][1], lama = data[i][5];
+        if (String(lama).trim() === String(sekolahBaru).trim()) {
+          throw buatError(ERR.VALIDATION, 'Sekolah tujuan sama dengan sekolah asal');
+        }
+        Repo.updateCell(CONFIG.SHEETS.GURU, i + 2, 6, String(sekolahBaru).trim());
+        return { success: true, message: 'Mutasi berhasil! "' + nama + '" pindah dari "' + lama + '" ke "' + sekolahBaru + '"' };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'NIP tidak ditemukan');
+  }
+};
+
+// ═══ BULK UPLOAD SERVICE ═══
+var BulkUploadService = {
+  MAX_ROWS: CONFIG.BULK_UPLOAD_MAX_ROWS,
+  MAX_FILE_SIZE: CONFIG.BULK_UPLOAD_MAX_SIZE,
+
+  parseCSV: function(csvText) {
+    var lines = String(csvText).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    lines = lines.filter(function(l) { return l.trim() !== ''; });
+    if (lines.length < 2) throw buatError(ERR.VALIDATION, 'File CSV kosong atau hanya berisi header.');
+    var delimiter = lines[0].indexOf(';') !== -1 && lines[0].indexOf(',') === -1 ? ';' : ',';
+    var parseLine = function(line) {
+      var result = [], current = '', inQuotes = false;
+      for (var i = 0; i < line.length; i++) {
+        var c = line[i];
+        if (c === '"') { inQuotes = !inQuotes; }
+        else if (c === delimiter && !inQuotes) { result.push(current); current = ''; }
+        else { current += c; }
+      }
+      result.push(current);
+      return result.map(function(v) { return String(v || '').trim(); });
+    };
+    var headers = parseLine(lines[0]).map(function(h) { return h.toLowerCase(); });
+    var rows = [];
+    for (var i = 1; i < lines.length; i++) {
+      var cols = parseLine(lines[i]);
+      if (cols.length < 2 || (cols.length === 2 && !cols[0] && !cols[1])) continue;
+      var obj = {};
+      headers.forEach(function(h, idx) { obj[h] = cols[idx] || ''; });
+      rows.push(obj);
+    }
+    return { headers: headers, rows: rows };
+  },
+
+  normalizeHeader: function(h) {
+    h = String(h || '').toLowerCase().trim()
+      .replace(/[\s_\-]+/g, '')
+      .replace(/jeniskelamin|jk/, 'jk')
+      .replace(/golonganruang|goruang|golruang|golongan/, 'gol')
+      .replace(/sekolah|unitkerja/, 'sekolah');
+    if (h.indexOf('nip') !== -1) return 'nip';
+    if (h.indexOf('nama') !== -1) return 'nama';
+    if (h === 'jk' || h === 'jeniskelamin') return 'jk';
+    if (h === 'status' || h.indexOf('status') !== -1) return 'status';
+    if (h === 'gol' || h.indexOf('golongan') !== -1) return 'gol';
+    if (h === 'sekolah' || h.indexOf('sekolah') !== -1) return 'sekolah';
+    return h;
+  },
+
+  process: function(csvText, actor) {
+    ErrorHandler.wajib(csvText, 'File CSV');
+    if (csvText.length > this.MAX_FILE_SIZE * 2) {
+      throw buatError(ERR.VALIDATION, 'File terlalu besar (maks 2 MB).');
+    }
+    var parsed = this.parseCSV(csvText);
+    if (parsed.rows.length > this.MAX_ROWS) {
+      throw buatError(ERR.VALIDATION, 'Maksimal ' + this.MAX_ROWS + ' baris per upload. Ditemukan: ' + parsed.rows.length);
+    }
+    var headerMap = {};
+    parsed.headers.forEach(function(h) { headerMap[this.normalizeHeader(h)] = h; }.bind(this));
+    var requiredFields = ['nip', 'nama', 'sekolah'];
+    for (var r = 0; r < requiredFields.length; r++) {
+      if (!headerMap[requiredFields[r]]) {
+        throw buatError(ERR.VALIDATION, 'Kolom "' + requiredFields[r] + '" tidak ditemukan di header CSV.');
+      }
+    }
+    var sekolahValid = {};
+    SekolahService.getDaftar().forEach(function(s) { sekolahValid[s.nama.toLowerCase()] = s.nama; });
+    var hasil = {
+      total: parsed.rows.length, berhasil: 0, dilewati: 0, gagal: 0,
+      detailGagal: [], detailBerhasil: []
+    };
+    var rowsToInsert = [];
+    var existingNips = {};
+    var allGuru = Repo.bacaData(CONFIG.SHEETS.GURU, 6);
+    allGuru.forEach(function(r) {
+      if (r[0]) existingNips[Utils.nipClean(r[0])] = true;
+    });
+    for (var i = 0; i < parsed.rows.length; i++) {
+      var row = parsed.rows[i];
+      var barisKe = i + 2;
+      var getField = function(key) {
+        var h = headerMap[key];
+        return h ? String(row[h] || '').trim() : '';
+      };
+      var nip = Utils.nipClean(getField('nip'));
+      var nama = getField('nama');
+      var jk = getField('jk').toUpperCase();
+      var status = getField('status');
+      var gol = getField('gol');
+      var sekolah = getField('sekolah');
+      if (!nip || !nama || !sekolah) {
+        hasil.gagal++;
+        hasil.detailGagal.push({ baris: barisKe, nip: nip || '-', nama: nama || '-', alasan: 'NIP/Nama/Sekolah kosong' });
+        continue;
+      }
+      if (!/^\d{8,18}$/.test(nip)) {
+        hasil.gagal++;
+        hasil.detailGagal.push({ baris: barisKe, nip: nip, nama: nama, alasan: 'Format NIP tidak valid (harus 8-18 digit)' });
+        continue;
+      }
+      if (existingNips[nip]) { hasil.dilewati++; continue; }
+      if (jk !== 'L' && jk !== 'P') jk = 'L';
+      var statusUpper = String(status || '').toUpperCase();
+      if (statusUpper !== 'PNS' && statusUpper !== 'PPPK' && statusUpper.indexOf('PARUH WAKTU') === -1) status = 'PNS';
+      else status = status || 'PNS';
+      var sekolahMatch = sekolahValid[sekolah.toLowerCase()];
+      if (!sekolahMatch) {
+        hasil.gagal++;
+        hasil.detailGagal.push({ baris: barisKe, nip: nip, nama: nama, alasan: 'Sekolah tidak ditemukan: "' + sekolah + '"' });
+        continue;
+      }
+      rowsToInsert.push([nip, nama, jk, status, gol, sekolahMatch]);
+      existingNips[nip] = true;
+      hasil.berhasil++;
+      hasil.detailBerhasil.push({ baris: barisKe, nip: nip, nama: nama, sekolah: sekolahMatch });
+    }
+    if (rowsToInsert.length > 0) {
+      try { Repo.batchAppendRows(CONFIG.SHEETS.GURU, rowsToInsert); }
+      catch (e) { throw buatError(ERR.SYSTEM, 'Gagal menyimpan ke database: ' + e.message); }
+    }
+    try {
+      Repo.appendRow(CONFIG.SHEETS.AUDIT, [
+        Utils.formatTimestampDetik(), 'bulkUploadGuru', 'BULK_UPLOAD',
+        'Total: ' + hasil.total + ' | Berhasil: ' + hasil.berhasil + ' | Lewati: ' + hasil.dilewati + ' | Gagal: ' + hasil.gagal,
+        String(actor || 'Admin'), 'OK'
+      ]);
+    } catch (eA) {}
+    return { success: true, data: hasil };
+  }
+};
+
+// ═══ CUTI SERVICE ═══
+var CutiService = {
+  cekTumpangTindih: function(nip, tglMulaiISO, tglSelesaiISO) {
+    var target = Utils.nipClean(nip);
+    var mulai = Utils.parseTanggalAman(tglMulaiISO);
+    var selesai = Utils.parseTanggalAman(tglSelesaiISO);
+    if (!mulai || !selesai) return { beririsan: false };
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, 16);
+    for (var i = 0; i < data.length; i++) {
+      var r = data[i];
+      if (Utils.nipClean(r[2]) !== target) continue;
+      var st = String(r[14] || '');
+      if (st !== CONFIG.STATUS.MENUNGGU && st !== CONFIG.STATUS.DISETUJUI) continue;
+      var m2 = Utils.parseTanggalAman(r[8]);
+      var s2 = Utils.parseTanggalAman(r[9]);
+      if (!m2 || !s2) continue;
+      if (mulai <= s2 && selesai >= m2) {
+        return {
+          beririsan: true,
+          no: r[0],
+          tglMulai: Utils.fmtTanggal(r[8]),
+          tglSelesai: Utils.fmtTanggal(r[9]),
+          status: st
+        };
+      }
+    }
+    return { beririsan: false };
+  },
+
+  submit: function(fd) {
+    ErrorHandler.wajib(fd.nip, 'NIP');
+    ErrorHandler.wajib(fd.jenisCuti, 'Jenis Cuti');
+    ErrorHandler.wajib(fd.tanggalMulai, 'Tanggal Mulai');
+    ErrorHandler.wajib(fd.tanggalSelesai, 'Tanggal Selesai');
+    ErrorHandler.wajib(fd.nipAtasanLangsung, 'NIP Atasan Langsung');
+
+    if (Utils.nipClean(fd.nip) === Utils.nipClean(fd.nipAtasanLangsung)) {
+      throw buatError(ERR.VALIDATION, 'NIP Atasan tidak boleh sama dengan NIP pemohon.');
+    }
+
+    var guru = GuruService.cariByNip(fd.nip);
+    if (!guru.success) throw buatError(ERR.NOT_FOUND, 'NIP pemohon tidak terdaftar di database.');
+    var namaDB = guru.data.nama, statusDB = guru.data.status, sekolahDB = guru.data.sekolah;
+
+    if (String(fd.unitKerja || '').trim() !== String(sekolahDB).trim()) {
+      throw buatError(ERR.VALIDATION, 'Unit kerja tidak cocok dengan data guru di database.');
+    }
+
+    var resAtasan = GuruService.cariByNip(fd.nipAtasanLangsung);
+    if (!resAtasan.success || !resAtasan.data.nama) {
+      throw buatError(ERR.VALIDATION, 'NIP atasan tidak terdaftar.');
+    }
+
+    var jenisValid = InfoCutiService.getJenisCuti().map(function(i) { return i.nama; });
+    if (jenisValid.indexOf(String(fd.jenisCuti).trim()) === -1) {
+      throw buatError(ERR.VALIDATION, 'Jenis cuti tidak valid.');
+    }
+
+    var mulai = Utils.parseTanggalAman(fd.tanggalMulai);
+    var selesai = Utils.parseTanggalAman(fd.tanggalSelesai);
+    if (!mulai || !selesai) {
+      throw buatError(ERR.VALIDATION, 'Tanggal cuti tidak valid (format atau nilai salah).');
+    }
+    if (selesai < mulai) {
+      throw buatError(ERR.VALIDATION, 'Tanggal selesai tidak boleh sebelum tanggal mulai.');
+    }
+
+    var now = new Date();
+    var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var jenisCutiStr = String(fd.jenisCuti).trim();
+
+    // ═══ LOGIKA VALIDASI TANGGAL YANG SINKRON DENGAN REGULASI & KONDISI RIIL ═══
+    // 1. Cuti Sakit: Boleh diajukan mundur (susulan) maks 14 hari ke belakang
+    // 2. Cuti Alasan Penting: Boleh mundur maks 7 hari ke belakang (kejadian darurat/kematian)
+    // 3. Cuti lainnya (Tahunan, Besar, Bersama, CLTN): Harus hari ini atau masa depan
+    var batasMundur = new Date(today);
+    if (jenisCutiStr === 'Cuti Sakit') {
+      batasMundur.setDate(today.getDate() - 14);
+      if (mulai < batasMundur) {
+        throw buatError(ERR.VALIDATION, 'Pengajuan Cuti Sakit susulan maksimal 14 hari ke belakang.');
+      }
+    } else if (jenisCutiStr === 'Cuti Karena Alasan Penting') {
+      batasMundur.setDate(today.getDate() - 7);
+      if (mulai < batasMundur) {
+        throw buatError(ERR.VALIDATION, 'Pengajuan Cuti Karena Alasan Penting darurat maksimal 7 hari ke belakang.');
+      }
+    } else {
+      if (mulai < today) {
+        throw buatError(ERR.VALIDATION, 'Tanggal mulai cuti tidak boleh di masa lalu untuk ' + jenisCutiStr + '.');
+      }
+    }
+
+    // Fleksibilitas batas masa depan: Melahirkan & Alasan Penting maks 2 tahun, lainnya maks 1 tahun
+    var isCutiFleksibel = (jenisCutiStr === 'Cuti Melahirkan' || jenisCutiStr === 'Cuti Karena Alasan Penting');
+    var batasMaju = new Date(today.getFullYear(), today.getMonth(), today.getDate() + (isCutiFleksibel ? 730 : 365));
+    if (selesai > batasMaju) {
+      if (isCutiFleksibel) throw buatError(ERR.VALIDATION, 'Tanggal terlalu jauh (maksimal 2 tahun ke depan untuk ' + jenisCutiStr + ').');
+      throw buatError(ERR.VALIDATION, 'Tanggal terlalu jauh (>1 tahun ke depan).');
+    }
+
+    if (!isCutiFleksibel && mulai.getFullYear() !== selesai.getFullYear()) {
+      throw buatError(ERR.VALIDATION, 'Pengajuan cuti tidak boleh lintas tahun.');
+    }
+
+    var normalizeDate = function(d) {
+      return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    };
+    var tglMulaiStr = normalizeDate(mulai), tglSelesaiStr = normalizeDate(selesai);
+    var lama = Utils.hitungHariKerja(tglMulaiStr, tglSelesaiStr);
+    if (lama <= 0) throw buatError(ERR.VALIDATION, 'Durasi hari kerja efektif 0 hari kerja. Periksa kembali tanggal cuti.');
+    if (lama > 90) throw buatError(ERR.VALIDATION, 'Durasi cuti terlalu panjang (>90 hari kerja).');
+
+    var no, lock = LockService.getScriptLock();
+    try {
+      lock.tryLock(CONFIG.LOCK_TIMEOUT_MS);
+      var overlap = CutiService.cekTumpangTindih(fd.nip, tglMulaiStr, tglSelesaiStr);
+      if (overlap.beririsan) {
+        throw buatError(ERR.VALIDATION, 'Periode cuti bertabrakan dengan pengajuan No. ' + overlap.no + ' (' + overlap.tglMulai + ' s.d. ' + overlap.tglSelesai + ', status: ' + overlap.status + ').');
+      }
+
+      if (jenisCutiStr === CONFIG.CUTI_TAHUNAN) {
+        var resSisa = CutiService.getSisa(fd.nip, tglMulaiStr, tglSelesaiStr);
+        if (!resSisa.success) throw buatError(ERR.SYSTEM, 'Gagal memeriksa sisa cuti.');
+        if (resSisa.data.diminta > resSisa.data.sisa) {
+          throw buatError(ERR.VALIDATION, 'Melebihi sisa cuti tahunan ' + resSisa.data.tahun + '. Sisa: ' + resSisa.data.sisa + ' | Diajukan: ' + resSisa.data.diminta + ' hari kerja.');
+        }
+      }
+
+      // Format tanggal pengajuan disimpan sebagai teks murni string 'dd-MM-yyyy'
+      var tglPengajuanStr = Utils.formatTanggalPengajuan();
+      no = Repo.getNextNo(CONFIG.SHEETS.DB);
+      Repo.ensureMinColumns(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+      
+      // Menggunakan kutip satu "'" di awal tglPengajuanStr agar Google Sheets tidak mengubahnya menjadi Date ber-locale US
+      Repo.appendRow(CONFIG.SHEETS.DB, [
+        no,
+        "'" + tglPengajuanStr,
+        "'" + String(fd.nip).trim(),
+        namaDB,
+        String(fd.jabatan || 'Guru').trim(),
+        sekolahDB,
+        String(fd.jenisCuti).trim(),
+        String(fd.alasan || '').trim(),
+        tglMulaiStr,
+        tglSelesaiStr,
+        lama,
+        String(fd.alamat || '').trim(),
+        String(fd.noHP || '').trim(),
+        statusDB,
+        CONFIG.STATUS.MENUNGGU,
+        '',
+        resAtasan.data.nama,
+        resAtasan.data.nip,
+        '',
+        '',
+        String(fd.email || '').trim(),
+        ''
+      ]);
+
+      try {
+        Repo.appendRow(CONFIG.SHEETS.STATUS_HISTORY, [
+          Utils.generateId(), Utils.formatTimestampDetik(), no, '-', CONFIG.STATUS.MENUNGGU,
+          'Pengajuan baru dibuat oleh ' + namaDB + ' pada ' + tglPengajuanStr, namaDB
+        ]);
+      } catch (eH) {}
+
+    } finally {
+      try { lock.releaseLock(); } catch (eL) {}
+    }
+
+    return { no: no, lama: lama, tanggalPengajuan: tglPengajuanStr };
+  },
+
+  getStatistik: function(fu) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, 16), t = 0, m = 0, d = 0, r = 0;
+    var filter = String(fu || '').trim();
+    data.forEach(function(row) {
+      if (String(row[2] || '').trim() === '' && String(row[3] || '').trim() === '') return;
+      if (filter && filter !== 'null' && filter !== 'undefined' && String(row[5] || '').trim() !== filter) return;
+      t++;
+      if (row[14] === CONFIG.STATUS.MENUNGGU) m++;
+      else if (row[14] === CONFIG.STATUS.DISETUJUI) d++;
+      else if (row[14] === CONFIG.STATUS.DITOLAK || row[14] === CONFIG.STATUS.REVISI) r++;
+    });
+    return { total: t, menunggu: m, disetujui: d, ditolak: r };
+  },
+
+  getRecent: function(fu) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, 16).filter(function(r) {
+      return String(r[2] || '').trim() !== '' || String(r[3] || '').trim() !== '';
+    });
+    var filter = String(fu || '').trim();
+    if (filter && filter !== 'null' && filter !== 'undefined') {
+      data = data.filter(function(r) { return String(r[5] || '').trim() === filter; });
+    }
+    return data.slice(-10).reverse().map(function(r) {
+      return {
+        no: r[0],
+        tanggal: Utils.fmtTanggal(r[1]),
+        nama: r[3],
+        unitKerja: r[5],
+        jenisCuti: r[6],
+        lamaCuti: r[10],
+        status: r[14]
+      };
+    });
+  },
+
+  getAll: function(fu) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, 16).filter(function(r) {
+      return String(r[2] || '').trim() !== '' || String(r[3] || '').trim() !== '';
+    });
+    var filter = String(fu || '').trim();
+    if (filter && filter !== 'null' && filter !== 'undefined') {
+      data = data.filter(function(r) { return String(r[5] || '').trim() === filter; });
+    }
+    return data.map(function(r) {
+      return {
+        no: r[0],
+        tanggal: Utils.fmtTanggal(r[1]),
+        nip: String(r[2] || ''),
+        nama: r[3],
+        unitKerja: r[5],
+        jenisCuti: r[6],
+        status: r[14],
+        catatan: r[15] || ''
+      };
+    }).reverse();
+  },
+
+  getDetail: function(no) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+    for (var i = 0; i < data.length; i++) {
+      if (String(data[i][0]) == String(no)) {
+        var r = data[i];
+        return {
+          no: r[0],
+          tanggal: Utils.fmtTanggal(r[1]),
+          nip: String(r[2] || ''),
+          nama: r[3],
+          jabatan: r[4],
+          unitKerja: r[5],
+          jenisCuti: r[6],
+          alasan: r[7],
+          tanggalMulai: Utils.fmtTanggal(r[8]),
+          tanggalSelesai: Utils.fmtTanggal(r[9]),
+          tanggalMulaiISO: Utils.toISOTanggal(r[8]),
+          tanggalSelesaiISO: Utils.toISOTanggal(r[9]),
+          lamaCuti: r[10],
+          alamat: r[11],
+          noHP: String(r[12] || ''),
+          statusKepegawaian: r[13],
+          status: r[14],
+          catatan: r[15] || '',
+          atasanLangsung: r[16] || '',
+          nipAtasanLangsung: String(r[17] || ''),
+          tglVerifikasi: Utils.fmtTanggal(r[18]),
+          verifikator: r[19] || '',
+          email: String(r[20] || ''),
+          calendarEventId: String(r[21] || '')
+        };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'Data tidak ditemukan.');
+  },
+
+  updateStatus: function(no, status, catatan, verifikator) {
+    var ALLOWED = [CONFIG.STATUS.MENUNGGU, CONFIG.STATUS.DISETUJUI, CONFIG.STATUS.DITOLAK, CONFIG.STATUS.REVISI];
+    if (ALLOWED.indexOf(String(status)) === -1) throw buatError(ERR.VALIDATION, 'Status tidak valid.');
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+    for (var i = 0; i < data.length; i++) {
+      if (String(data[i][0]) == String(no)) {
+        var row = i + 2;
+        var oldStatus = String(data[i][14] || CONFIG.STATUS.MENUNGGU);
+        var allowedNext = CONFIG.STATUS_TRANSITIONS[oldStatus] || [];
+        if (oldStatus !== status && allowedNext.indexOf(status) === -1) {
+          throw buatError(ERR.VALIDATION, 'Transisi status tidak valid: ' + oldStatus + ' → ' + status);
+        }
+        if ((status === CONFIG.STATUS.DITOLAK || status === CONFIG.STATUS.REVISI) && (!catatan || String(catatan).trim() === '')) {
+          throw buatError(ERR.VALIDATION, 'Catatan wajib diisi untuk status ' + status + '.');
+        }
+        var ups = [
+          { row: row, col: 15, value: status },
+          { row: row, col: 16, value: catatan || '' }
+        ];
+        if (status !== CONFIG.STATUS.MENUNGGU) {
+          ups.push({ row: row, col: 19, value: Utils.formatTimestamp() });
+          ups.push({ row: row, col: 20, value: String(verifikator || '') });
+        }
+        Repo.batchUpdateCells(CONFIG.SHEETS.DB, ups);
+        try {
+          Repo.appendRow(CONFIG.SHEETS.STATUS_HISTORY, [
+            Utils.generateId(), Utils.formatTimestampDetik(), no, oldStatus, status,
+            String(catatan || '').substring(0, 500), String(verifikator || 'Sistem')
+          ]);
+        } catch (eH) {}
+        return {
+          dataPemohon: {
+            no: data[i][0],
+            nama: data[i][3],
+            nip: String(data[i][2] || ''),
+            unitKerja: data[i][5],
+            jenisCuti: data[i][6],
+            tanggalPengajuan: Utils.fmtTanggal(data[i][1]),
+            tanggalMulai: data[i][8],
+            tanggalSelesai: data[i][9],
+            noHP: data[i][12],
+            email: String(data[i][20] || '')
+          },
+          oldStatus: oldStatus
+        };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'Data tidak ditemukan');
+  },
+
+  getSisa: function(nip, tm, ts) {
+    var target = Utils.nipClean(nip);
+    if (!target) return { success: false, message: 'NIP belum diisi.' };
+    var resGuru;
+    try { resGuru = GuruService.cariByNip(target); } catch (e) { resGuru = { success: false }; }
+    var statusKep = resGuru.success ? String(resGuru.data.status || '') : '';
+    var tanggalMulai = Utils.parseTanggalAman(tm);
+    var tahun = tanggalMulai ? tanggalMulai.getFullYear() : new Date().getFullYear();
+    var milik = Repo.bacaData(CONFIG.SHEETS.DB, 16).filter(function(r) {
+      return (String(r[2] || '').trim() !== '' || String(r[3] || '').trim() !== '') &&
+             Utils.nipClean(r[2]) === target && String(r[6] || '').trim() === CONFIG.CUTI_TAHUNAN;
+    });
+
+    function daftarTahun(thn, st) {
+      return milik.filter(function(r) {
+        return Utils.getTahunDariTanggal(r[8]) === thn && st.indexOf(String(r[14])) !== -1;
+      }).map(function(r) {
+        return {
+          no: r[0],
+          mulai: Utils.fmtTanggal(r[8]),
+          selesai: Utils.fmtTanggal(r[9]),
+          hari: Utils.hitungHariKerja(r[8], r[9]),
+          status: r[14]
+        };
+      });
+    }
+
+    var terpakaiList = daftarTahun(tahun, [CONFIG.STATUS.DISETUJUI]);
+    var pendingList = daftarTahun(tahun, [CONFIG.STATUS.MENUNGGU]);
+    var usedT1 = daftarTahun(tahun - 1, [CONFIG.STATUS.DISETUJUI]).reduce(function(s, x) { return s + x.hari; }, 0);
+    var usedT2 = daftarTahun(tahun - 2, [CONFIG.STATUS.DISETUJUI]).reduce(function(s, x) { return s + x.hari; }, 0);
+    var terpakai = terpakaiList.reduce(function(s, x) { return s + x.hari; }, 0);
+    var pending = pendingList.reduce(function(s, x) { return s + x.hari; }, 0);
+    var statusUpper = String(statusKep || '').toUpperCase().trim();
+    var isPNS = statusUpper === 'PNS';
+    var isPPPKParuhWaktu = statusUpper.indexOf('PARUH WAKTU') !== -1;
+    var isPPPK = (statusUpper === 'PPPK') || (statusUpper.indexOf('PPPK') !== -1 && !isPPPKParuhWaktu && !isPNS);
+    var sisaT1 = 0, sisaT2 = 0, kuotaTotal = 12, ket = '';
+
+    if (isPNS) {
+      sisaT1 = Math.max(0, 12 - usedT1);
+      sisaT2 = Math.max(0, 12 - usedT2);
+      if (sisaT1 > 0) kuotaTotal = Math.min(18, 12 + sisaT1);
+      if (sisaT2 > 0 && sisaT1 > 0) kuotaTotal = Math.min(24, 12 + sisaT1 + sisaT2);
+      ket = 'PNS: hak dasar 12 hari kerja/tahun. Akumulasi sisa cuti tahun sebelumnya dapat dibawa (maks. 18 hari, kondisi tertentu 24 hari).';
+    } else if (isPPPKParuhWaktu) {
+      kuotaTotal = 12;
+      ket = 'PPPK Paruh Waktu: hak 12 hari kerja per tahun (tanpa akumulasi).';
+    } else if (isPPPK) {
+      kuotaTotal = 12;
+      ket = 'PPPK: hak 12 hari kerja per tahun tanpa akumulasi sisa cuti tahun sebelumnya.';
+    } else {
+      ket = 'Status kepegawaian: ' + (statusKep || '-') + '. Hak cuti mengikuti ketentuan yang berlaku.';
+    }
+
+    var sisa = Math.max(0, kuotaTotal - terpakai);
+    var diminta = (tm && ts) ? Utils.hitungHariKerja(tm, ts) : 0;
+    return {
+      success: true,
+      data: {
+        nip: resGuru.success ? resGuru.data.nip : target,
+        nama: resGuru.success ? resGuru.data.nama : '(NIP tidak ditemukan)',
+        sekolah: resGuru.success ? resGuru.data.sekolah : '-',
+        statusKepegawaian: statusKep || '-',
+        tahun: tahun,
+        kuotaDasar: 12,
+        sisaTahunLalu: sisaT1,
+        sisaDuaTahunLalu: sisaT2,
+        kuotaTotal: kuotaTotal,
+        terpakai: terpakai,
+        pending: pending,
+        sisa: sisa,
+        diminta: diminta,
+        melebihi: diminta > sisa,
+        keterangan: ket,
+        rincianTerpakai: terpakaiList,
+        rincianPending: pendingList
+      }
+    };
+  },
+
+  getRiwayatStatus: function(no) {
+    var data = Repo.bacaData(CONFIG.SHEETS.STATUS_HISTORY, 7);
+    return data.filter(function(r) { return String(r[2]) === String(no); })
+      .map(function(r) {
+        return {
+          timestamp: r[1],
+          no: r[2],
+          statusLama: r[3],
+          statusBaru: r[4],
+          catatan: r[5] || '',
+          aktor: r[6] || ''
+        };
+      });
+  },
+
+  hapus: function(no, alasan, aktor) {
+    ErrorHandler.wajib(no, 'No Pengajuan');
+    ErrorHandler.wajib(alasan, 'Alasan penghapusan');
+    var data = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+    var rowIndex = -1, rowData = null;
+    for (var i = 0; i < data.length; i++) {
+      if (String(data[i][0]) == String(no)) { rowIndex = i; rowData = data[i]; break; }
+    }
+    if (rowIndex === -1 || !rowData) {
+      throw buatError(ERR.NOT_FOUND, 'Data pengajuan No. ' + no + ' tidak ditemukan.');
+    }
+    var status = String(rowData[14] || '');
+    if (status !== CONFIG.STATUS.MENUNGGU) {
+      throw buatError(ERR.FORBIDDEN, 'Pengajuan dengan status "' + status + '" tidak dapat dihapus. Hanya pengajuan berstatus "Menunggu Verifikasi" yang boleh dihapus oleh admin.');
+    }
+    var nip = String(rowData[2] || ''), nama = String(rowData[3] || '');
+    var unitKerja = String(rowData[5] || ''), jenisCuti = String(rowData[6] || '');
+    var tglPengajuan = Utils.fmtTanggal(rowData[1]);
+    var sh = Repo.getSheet(CONFIG.SHEETS.DB);
+    if (!sh) throw buatError(ERR.SYSTEM, 'Sheet Database tidak ditemukan.');
+    sh.deleteRow(rowIndex + 2);
+    bumpCacheVersion();
+
+    try {
+      var shAudit = Repo.getSheet(CONFIG.SHEETS.AUDIT);
+      if (!shAudit) {
+        shAudit = Repo.getSpreadsheet().insertSheet(CONFIG.SHEETS.AUDIT);
+        shAudit.getRange(1, 1, 1, 6).setValues([['Timestamp', 'Konteks', 'Kategori', 'Pesan', 'Detail', 'Stack']])
+          .setFontWeight('bold').setBackground('#c0392b').setFontColor('#fff');
+      }
+      shAudit.appendRow([
+        Utils.formatTimestampDetik(), 'hapusPengajuan', 'DELETE',
+        'No ' + no + ' (' + nama + ' / ' + nip + ')',
+        'Alasan: ' + String(alasan).substring(0, 500) + ' | Oleh: ' + String(aktor || 'Admin'),
+        'Data lama: Jenis=' + jenisCuti + ', Unit=' + unitKerja + ', Tgl=' + tglPengajuan
+      ]);
+    } catch (eA) { console.error('Gagal menulis audit log: ' + eA.toString()); }
+
+    try {
+      Repo.appendRow(CONFIG.SHEETS.STATUS_HISTORY, [
+        Utils.generateId(), Utils.formatTimestampDetik(), no,
+        CONFIG.STATUS.MENUNGGU, '[DIHAPUS]',
+        'Alasan: ' + String(alasan).substring(0, 500), String(aktor || 'Admin')
+      ]);
+    } catch (eH) {}
+
+    return {
+      success: true,
+      message: 'Pengajuan No. ' + no + ' atas nama ' + nama + ' berhasil dihapus.',
+      data: { no: no, nama: nama, nip: nip, unitKerja: unitKerja, jenisCuti: jenisCuti }
+    };
+  }
+};
+
+// ═══ LAPORAN SERVICE ═══
+var LaporanService = {
+  getRekap: function(params) {
+    var tahun = Number(params.tahun) || new Date().getFullYear();
+    var bulan = params.bulan ? Number(params.bulan) : null;
+    var unitKerja = params.unitKerja || '', jenisCuti = params.jenisCuti || '', status = params.status || '';
+    var hasil = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB).filter(function(r) {
+      if (String(r[2] || '').trim() === '' && String(r[3] || '').trim() === '') return false;
+      var t = Utils.parseTanggalAman(r[8]);
+      if (!t || t.getFullYear() !== tahun) return false;
+      if (bulan && t.getMonth() + 1 !== bulan) return false;
+      if (unitKerja && String(r[5] || '').trim() !== unitKerja) return false;
+      if (jenisCuti && String(r[6] || '').trim() !== jenisCuti) return false;
+      if (status && String(r[14] || '').trim() !== status) return false;
+      return true;
+    });
+
+    var rekap = {
+      total: hasil.length,
+      menunggu: 0,
+      disetujui: 0,
+      ditolak: 0,
+      revisi: 0,
+      totalHari: 0,
+      perJenis: {},
+      perUnit: {},
+      perBulan: {},
+      data: hasil.map(function(r) {
+        return {
+          no: r[0],
+          tanggal: Utils.fmtTanggal(r[1]),
+          nip: String(r[2] || ''),
+          nama: r[3],
+          unitKerja: r[5],
+          jenisCuti: r[6],
+          lamaCuti: Number(r[10]) || 0,
+          status: r[14],
+          tglMulai: Utils.fmtTanggal(r[8]),
+          tglSelesai: Utils.fmtTanggal(r[9])
+        };
+      })
+    };
+
+    hasil.forEach(function(r) {
+      var st = String(r[14] || '');
+      if (st === CONFIG.STATUS.MENUNGGU) rekap.menunggu++;
+      else if (st === CONFIG.STATUS.DISETUJUI) rekap.disetujui++;
+      else if (st === CONFIG.STATUS.DITOLAK) rekap.ditolak++;
+      else if (st === CONFIG.STATUS.REVISI) rekap.revisi++;
+      rekap.totalHari += Number(r[10]) || 0;
+      var jc = String(r[6] || 'Lainnya');
+      if (!rekap.perJenis[jc]) rekap.perJenis[jc] = { count: 0, hari: 0 };
+      rekap.perJenis[jc].count++; rekap.perJenis[jc].hari += Number(r[10]) || 0;
+      var un = String(r[5] || 'Tidak Diketahui');
+      if (!rekap.perUnit[un]) rekap.perUnit[un] = { count: 0, hari: 0 };
+      rekap.perUnit[un].count++; rekap.perUnit[un].hari += Number(r[10]) || 0;
+      var t2 = Utils.parseTanggalAman(r[8]);
+      if (t2) {
+        var bk = t2.getMonth() + 1;
+        if (!rekap.perBulan[bk]) rekap.perBulan[bk] = { count: 0, hari: 0 };
+        rekap.perBulan[bk].count++; rekap.perBulan[bk].hari += Number(r[10]) || 0;
+      }
+    });
+
+    return {
+      success: true,
+      data: rekap,
+      params: { tahun: tahun, bulan: bulan, unitKerja: unitKerja, jenisCuti: jenisCuti, status: status }
+    };
+  },
+
+  exportToSheet: function(params) {
+    var hasil = LaporanService.getRekap(params);
+    if (!hasil.success) return hasil;
+    var ss = Repo.getSpreadsheet();
+    var sheetName = 'Laporan_' + params.tahun + (params.bulan ? '_' + params.bulan : '') + '_' + Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyyMMdd_HHmmss');
+    var old = ss.getSheetByName(sheetName); if (old) ss.deleteSheet(old);
+    var sh = ss.insertSheet(sheetName);
+    var headers = ['No', 'Tanggal Pengajuan', 'NIP', 'Nama', 'Unit Kerja', 'Jenis Cuti', 'Tgl Mulai', 'Tgl Selesai', 'Lama (Hari Kerja)', 'Status'];
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+    if (hasil.data.data.length > 0) {
+      var rows = hasil.data.data.map(function(d) {
+        return [d.no, "'" + d.tanggal, "'" + d.nip, d.nama, d.unitKerja, d.jenisCuti, d.tglMulai, d.tglSelesai, d.lamaCuti, d.status];
+      });
+      for (var i = 0; i < rows.length; i += CONFIG.BATCH_SIZE) {
+        var b = rows.slice(i, i + CONFIG.BATCH_SIZE);
+        sh.getRange(i + 2, 1, b.length, headers.length).setValues(b);
+      }
+    }
+    var sr = hasil.data.data.length + 3;
+    sh.getRange(sr, 1).setValue('RINGKASAN').setFontWeight('bold');
+    sh.getRange(sr + 1, 1).setValue('Total Pengajuan:'); sh.getRange(sr + 1, 2).setValue(hasil.data.total);
+    sh.getRange(sr + 2, 1).setValue('Total Hari Kerja Cuti:'); sh.getRange(sr + 2, 2).setValue(hasil.data.totalHari);
+    sh.getRange(sr + 3, 1).setValue('Disetujui:'); sh.getRange(sr + 3, 2).setValue(hasil.data.disetujui);
+    sh.getRange(sr + 4, 1).setValue('Menunggu:'); sh.getRange(sr + 4, 2).setValue(hasil.data.menunggu);
+    sh.getRange(sr + 5, 1).setValue('Ditolak/Revisi:'); sh.getRange(sr + 5, 2).setValue(hasil.data.ditolak + hasil.data.revisi);
+    sh.setFrozenRows(1);
+    try { sh.getRange(2, 1, hasil.data.data.length, headers.length).setNumberFormat('@'); } catch (e) {}
+    Repo.appendRow(CONFIG.SHEETS.LAPORAN, [Utils.generateId(), Utils.formatTimestamp(), 'Export Sheet', JSON.stringify(params), 'Admin', 'Sukses', ss.getUrl() + '#gid=' + sh.getSheetId()]);
+    return { success: true, message: 'Laporan berhasil diexport ke Google Sheet!', sheetUrl: ss.getUrl() + '#gid=' + sh.getSheetId(), sheetName: sheetName };
+  },
+
+  getStatistikLengkap: function(tahun) {
+    tahun = Number(tahun) || new Date().getFullYear();
+    var filtered = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB).filter(function(r) {
+      if (String(r[2] || '').trim() === '' && String(r[3] || '').trim() === '') return false;
+      var t = Utils.parseTanggalAman(r[8]); return t && t.getFullYear() === tahun;
+    });
+    var stats = {
+      tahun: tahun,
+      totalPengajuan: filtered.length,
+      totalHariCuti: 0,
+      perStatus: { menunggu: 0, disetujui: 0, ditolak: 0, revisi: 0 },
+      perJenisCuti: {},
+      perBulan: [],
+      perUnitKerja: {},
+      rataRataLamaCuti: 0,
+      topUnitKerja: [],
+      topJenisCuti: []
+    };
+    var bulanArr = [];
+    for (var b = 1; b <= 12; b++) bulanArr.push({ bulan: b, nama: Utils.getBulanNama(b - 1), count: 0, hari: 0 });
+    filtered.forEach(function(r) {
+      var lama = Number(r[10]) || 0; stats.totalHariCuti += lama;
+      var st = String(r[14] || '');
+      if (st === CONFIG.STATUS.MENUNGGU) stats.perStatus.menunggu++;
+      else if (st === CONFIG.STATUS.DISETUJUI) stats.perStatus.disetujui++;
+      else if (st === CONFIG.STATUS.DITOLAK) stats.perStatus.ditolak++;
+      else if (st === CONFIG.STATUS.REVISI) stats.perStatus.revisi++;
+      var jc = String(r[6] || 'Lainnya'); if (!stats.perJenisCuti[jc]) stats.perJenisCuti[jc] = 0; stats.perJenisCuti[jc]++;
+      var un = String(r[5] || 'Tidak Diketahui'); if (!stats.perUnitKerja[un]) stats.perUnitKerja[un] = 0; stats.perUnitKerja[un]++;
+      var t2 = Utils.parseTanggalAman(r[8]); if (t2) { bulanArr[t2.getMonth()].count++; bulanArr[t2.getMonth()].hari += lama; }
+    });
+    stats.perBulan = bulanArr;
+    stats.rataRataLamaCuti = stats.totalPengajuan > 0 ? Math.round((stats.totalHariCuti / stats.totalPengajuan) * 10) / 10 : 0;
+    stats.topUnitKerja = Object.keys(stats.perUnitKerja).map(function(k) { return { unit: k, count: stats.perUnitKerja[k] }; }).sort(function(a, b) { return b.count - a.count; }).slice(0, 10);
+    stats.topJenisCuti = Object.keys(stats.perJenisCuti).map(function(k) { return { jenis: k, count: stats.perJenisCuti[k] }; }).sort(function(a, b) { return b.count - a.count; });
+    return { success: true, data: stats };
+  }
+};
+
+// ═══ DOKUMEN SERVICE ═══
+var DokumenService = {
+  upload: function(fd) {
+    ErrorHandler.wajib(fd.fileData, 'File');
+    var v = Utils.validasiFile(fd); if (!v.valid) throw buatError(ERR.VALIDATION, v.message);
+    var blob = Utilities.newBlob(Utilities.base64Decode(fd.fileData), fd.fileType, fd.fileName);
+    var hasil = Repo.simpanFileKeDrive(blob, DokumenService.getOrCreateFolder(fd));
+    DokumenService.simpanMetadata(fd, hasil.url);
+    return { success: true, message: 'Dokumen berhasil diunggah!', link: hasil.url };
+  },
+
+  uploadCabdin: function(fd) {
+    ErrorHandler.wajib(fd.fileData, 'File'); ErrorHandler.wajib(fd.noPengajuan, 'No Pengajuan');
+    var v = Utils.validasiFile(fd); if (!v.valid) throw buatError(ERR.VALIDATION, v.message);
+    var blob = Utilities.newBlob(Utilities.base64Decode(fd.fileData), fd.fileType, fd.fileName);
+    var root = Repo.getRootFolder();
+    var nf = Repo.getOrCreateSubFolder(Repo.getOrCreateSubFolder(root, 'Verifikasi_Cabdin'), 'No_' + fd.noPengajuan);
+    var hasil = Repo.simpanFileKeDrive(blob, nf);
+    fd.keterangan = 'Dokumen Balasan Cabdin';
+    DokumenService.simpanMetadata(fd, hasil.url);
+    return { success: true, message: 'Dokumen Cabdin berhasil diunggah!', link: hasil.url };
+  },
+
+  getOrCreateFolder: function(fd) {
+    var root = Repo.getRootFolder();
+    var fT = Repo.getOrCreateSubFolder(root, new Date().getFullYear().toString());
+    var fU = Repo.getOrCreateSubFolder(fT, Utils.sanitizeFilename(fd.unitKerja || 'Umum'));
+    return Repo.getOrCreateSubFolder(fU, Utils.nipClean(fd.nip) || 'TanpaNIP');
+  },
+
+  simpanMetadata: function(fd, link) {
+    Repo.appendRow(CONFIG.SHEETS.DOKUMEN, [
+      Repo.getNextNo(CONFIG.SHEETS.DOKUMEN),
+      Utils.formatTimestamp(),
+      "'" + String(fd.nip || '').trim(),
+      String(fd.nama || '').trim(),
+      String(fd.unitKerja || '').trim(),
+      String(fd.jenisDokumen || '').trim(),
+      fd.noPengajuan || '-',
+      String(fd.fileName || '').trim(),
+      String(fd.fileType || '').trim(),
+      Utils.formatFileSize(fd.fileSize),
+      link,
+      String(fd.keterangan || '').trim()
+    ]);
+  },
+
+  getList: function(fNIP, fUnit) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DOKUMEN, 12).filter(function(r) {
+      return String(r[3] || '').trim() !== '' || String(r[7] || '').trim() !== '';
+    });
+    var filter = String(fUnit || '').trim();
+    if (filter && filter !== 'null' && filter !== 'undefined') {
+      data = data.filter(function(r) { return String(r[4] || '').trim() === filter; });
+    }
+    if (fNIP) {
+      var nc = Utils.nipClean(fNIP);
+      data = data.filter(function(r) { return Utils.nipClean(r[2]) === nc; });
+    }
+    return data.map(function(r) {
+      return {
+        no: r[0],
+        tanggal: Utils.fmtTanggal(r[1]),
+        nama: r[3],
+        jenisDokumen: r[5],
+        fileName: r[7],
+        ukuran: r[9],
+        link: r[10]
+      };
+    }).reverse();
+  },
+
+  getByNoPengajuan: function(no) {
+    return Repo.bacaData(CONFIG.SHEETS.DOKUMEN, 12)
+      .filter(function(r) { return String(r[6] || '').trim() === String(no).trim(); })
+      .map(function(r) {
+        return {
+          no: r[0],
+          tanggal: Utils.fmtTanggal(r[1]),
+          nama: r[3],
+          jenisDokumen: r[5],
+          fileName: r[7],
+          ukuran: r[9],
+          link: r[10],
+          keterangan: r[11]
+        };
+      });
+  },
+
+  hapus: function(no) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DOKUMEN, 12);
+    for (var i = 0; i < data.length; i++) {
+      if (String(data[i][0]) == String(no)) {
+        var m = String(data[i][10]).match(/\/d\/([^/]+)/);
+        if (m) Repo.hapusFileDariDrive(m[1]);
+        Repo.hapusBaris(CONFIG.SHEETS.DOKUMEN, i + 2);
+        return { success: true, message: 'Dokumen berhasil dihapus.' };
+      }
+    }
+    throw buatError(ERR.NOT_FOUND, 'Dokumen tidak ditemukan.');
+  },
+
+  getStatistik: function(fu) {
+    var data = Repo.bacaData(CONFIG.SHEETS.DOKUMEN, 12).filter(function(r) {
+      return String(r[3] || '').trim() !== '' || String(r[7] || '').trim() !== '';
+    });
+    var filter = String(fu || '').trim();
+    if (filter && filter !== 'null' && filter !== 'undefined') {
+      data = data.filter(function(r) { return String(r[4] || '').trim() === filter; });
+    }
+    var now = new Date(), mg = new Date(now.getTime() - 7 * 86400000), b = 0, m = 0;
+    data.forEach(function(r) {
+      try {
+        var t = Utils.parseTanggalAman(String(r[1]));
+        if (!t) return;
+        if (t.getMonth() === now.getMonth() && t.getFullYear() === now.getFullYear()) b++;
+        if (t >= mg) m++;
+      } catch (e) {}
+    });
+    return { total: data.length, bulanIni: b, mingguIni: m };
+  }
+};
+
+// ═══ INFO CUTI ASN ═══
+var InfoCutiService = {
+  getJenisCuti: function() {
+    return [
+      {
+        nama: 'Cuti Tahunan',
+        untuk: 'PNS, PPPK, & PPPK Paruh Waktu',
+        jumlah: 'PNS: 12 hari/tahun (akumulasi maks. 18-24 hari). PPPK: 12 hari/tahun (tanpa akumulasi). PPPK Paruh Waktu: disesuaikan dengan perjanjian kerja.',
+        dasarHukum: 'UU 20/2023; PP 11/2017 jo. PP 17/2020; PP 49/2018; aturan teknis BKN/instansi.',
+        syarat: [
+          'ASN telah bekerja paling sedikit 1 tahun secara terus-menerus.',
+          'PNS: Sisa cuti tahun sebelumnya dapat diakumulasi (maksimal 18 hari, kondisi tertentu 24 hari).',
+          'PPPK: Mendapat 12 hari cuti tahunan tanpa akumulasi sisa cuti tahun sebelumnya.',
+          'PPPK Paruh Waktu: Hak cuti disesuaikan dengan jam kerja dan ketentuan dalam perjanjian kerja.',
+          'Cuti diajukan melalui sistem kepada atasan langsung & pejabat berwenang sebelum pelaksanaan.',
+          'Cuti dapat ditunda/ditolak bila kepentingan dinas mendesak.',
+          'Pemohon wajib memastikan unit kerja & atasan langsung valid dalam sistem.'
+        ],
+        dokumen: [
+          'Formulir/surat permohonan cuti tahunan.',
+          'Rekomendasi/persetujuan atasan langsung.',
+          'Ringkasan sisa cuti atau bukti pengecekan pada aplikasi (bila diminta).',
+          'Dokumen pendukung lain sesuai kebijakan unit kerja.'
+        ],
+        catatan: 'Lama cuti dihitung berdasarkan hari kerja efektif (tidak termasuk akhir pekan & hari libur nasional). Perbedaan hak cuti antara PNS, PPPK, dan PPPK Paruh Waktu mengikuti ketentuan UU 20/2023 dan aturan teknis BKN.'
+      },
+      {
+        nama: 'Cuti Besar',
+        untuk: 'PNS',
+        jumlah: 'Paling lama 3 bulan, dapat digunakan bertahap sesuai ketentuan.',
+        dasarHukum: 'UU 20/2023; PP 11/2017 jo. PP 17/2020; aturan teknis BKN/instansi.',
+        syarat: [
+          'PNS telah bekerja paling sedikit 5 tahun terus-menerus.',
+          'Untuk kepentingan tertentu (ibadah, pemulihan kesehatan, alasan penting lain).',
+          'Tidak mengganggu penyelesaian tugas & jabatan.',
+          'Diajukan jauh hari sebelum pelaksanaan, kecuali mendesak.'
+        ],
+        dokumen: [
+          'Formulir/surat permohonan cuti besar.',
+          'Bukti masa kerja 5 tahun.',
+          'Dokumen pendukung alasan cuti.',
+          'Persetujuan atasan langsung & pejabat berwenang.'
+        ],
+        catatan: 'Bukan hak otomatis tahunan; pejabat berwenang dapat menolak/menjadwalkan ulang.'
+      },
+      {
+        nama: 'Cuti Sakit',
+        untuk: 'PNS & PPPK',
+        jumlah: 'Sesuai keterangan dokter; jangka panjang maks. 1 tahun dan dapat diperpanjang sesuai ketentuan.',
+        dasarHukum: 'UU 20/2023; PP 11/2017 jo. PP 17/2020; PP 49/2018; aturan teknis BKN/instansi.',
+        syarat: [
+          'ASN tidak dapat menjalankan tugas karena sakit.',
+          'Wajib surat keterangan dokter untuk sakit lebih dari beberapa hari.',
+          'Jangka panjang memerlukan surat dokter pemerintah/tim penguji kesehatan.',
+          'Dapat diajukan secara susulan (maks. 14 hari ke belakang) oleh ASN atau keluarga bila tidak mampu.'
+        ],
+        dokumen: [
+          'Formulir/surat permohonan cuti sakit.',
+          'Surat keterangan dokter/klinik/RS dengan lama istirahat.',
+          'Resume medis/surat kontrol (jangka panjang).',
+          'Rekomendasi atasan langsung.'
+        ],
+        catatan: 'Bila terkait kecelakaan kerja, ikuti mekanisme tambahan sesuai aturan kepegawaian.'
+      },
+      {
+        nama: 'Cuti Melahirkan',
+        untuk: 'ASN perempuan',
+        jumlah: '3 bulan (atau sesuai ketentuan terbaru; dapat dibagi sebelum & sesudah persalinan).',
+        dasarHukum: 'UU 20/2023; PP 11/2017 jo. PP 17/2020; PP 49/2018; aturan teknis BKN/instansi.',
+        syarat: [
+          'Diajukan ASN perempuan yang akan melahirkan.',
+          'Menyertakan perkiraan persalinan dari dokter/bidan.',
+          'Diajukan sebelum pelaksanaan, kecuali mendesak.',
+          'Pendampingan suami menggunakan cuti alasan penting sesuai ketentuan.'
+        ],
+        dokumen: [
+          'Formulir/surat permohonan.',
+          'Surat keterangan dokter/bidan tentang kehamilan & perkiraan persalinan.',
+          'Akta kelahiran/surat keterangan lahir (susulan).',
+          'Persetujuan atasan langsung.'
+        ],
+        catatan: 'Unit kerja wajib mengatur pembagian tugas selama cuti.'
+      },
+      {
+        nama: 'Cuti Karena Alasan Penting',
+        untuk: 'PNS & PPPK',
+        jumlah: 'Paling lama 1 bulan, disesuaikan alasan & ketentuan.',
+        dasarHukum: 'UU 20/2023; PP 11/2017 jo. PP 17/2020; PP 49/2018; aturan teknis BKN/instansi.',
+        syarat: [
+          'Untuk alasan penting: menikah, menikahkan anak, khitanan, upacara keagamaan (termasuk umroh), istri melahirkan, keluarga sakit/meninggal, musibah/bencana.',
+          'Diajukan kepada atasan langsung & pejabat berwenang.',
+          'Lama cuti sebatas waktu wajar yang dibutuhkan.',
+          'Kejadian mendadak/darurat: boleh diajukan susulan maks 7 hari ke belakang.'
+        ],
+        dokumen: [
+          'Formulir/surat permohonan.',
+          'Dokumen sesuai alasan (surat nikah, akta kelahiran, surat kematian, keterangan bencana, bukti tiket umroh, dll).',
+          'Bukti hubungan keluarga bila diminta.',
+          'Persetujuan atasan langsung.'
+        ],
+        catatan: 'Suami yang mendampingi istri melahirkan menggunakan jenis ini bila diatur instansi. Termasuk juga ibadah umroh.'
+      },
+      {
+        nama: 'Cuti di Luar Tanggungan Negara',
+        untuk: 'PNS',
+        jumlah: 'Paling lama 6 bulan; dapat diperpanjang sesuai ketentuan.',
+        dasarHukum: 'UU 20/2023; PP 11/2017 jo. PP 17/2020; aturan teknis BKN/instansi.',
+        syarat: [
+          'Alasan penting yang tidak dapat ditunda.',
+          'Tidak menerima gaji & tunjangan selama cuti.',
+          'Masa cuti dapat tidak dihitung sebagai masa kerja.',
+          'Tidak sedang dalam proses pemberhentian.',
+          'Disetujui pejabat pembina kepegawaian.'
+        ],
+        dokumen: [
+          'Formulir/surat permohonan CLTN.',
+          'Surat pernyataan kesediaan tidak menerima gaji/tunjangan.',
+          'Dokumen pendukung alasan.',
+          'Rekomendasi atasan langsung & pejabat berwenang.'
+        ],
+        catatan: 'Memiliki konsekuensi administratif; konsultasikan dengan bagian kepegawaian.'
+      },
+      {
+        nama: 'Cuti Bersama',
+        untuk: 'ASN sesuai penetapan',
+        jumlah: 'Mengikuti penetapan pemerintah; tidak selalu mengurangi cuti tahunan.',
+        dasarHukum: 'Keputusan pemerintah tentang cuti bersama; ketentuan manajemen ASN.',
+        syarat: [
+          'Ditetapkan pemerintah.',
+          'Unit pelayanan publik tetap mengatur piket.',
+          'ASN yang bertugas saat cuti bersama dapat diberi kompensasi sesuai ketentuan.'
+        ],
+        dokumen: [
+          'Tidak ada dokumen individual (kecuali laporan piket unit).',
+          'Surat tugas/jadwal piket bila diperlukan.'
+        ],
+        catatan: 'Dapat dicatat sebagai Cuti Bersama/Cuti Tahunan sesuai kebijakan instansi.'
+      }
+    ];
+  },
+
+  getDokumenWajib: function(jenisCuti) {
+    var items = InfoCutiService.getJenisCuti();
+    var t = String(jenisCuti || '').trim();
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].nama === t) {
+        return { success: true, data: { nama: items[i].nama, dokumen: items[i].dokumen || [] } };
+      }
+    }
+    return { success: false, message: 'Jenis cuti tidak dikenali.' };
+  }
+};
+
+// ═══ CALENDAR SERVICE ═══
+var CalendarService = {
+  getCalendar: function() {
+    try {
+      var calId = PropertiesService.getScriptProperties().getProperty('CALENDAR_ID') || CONFIG.CALENDAR_ID;
+      return CalendarApp.getCalendarById(calId) || CalendarApp.getDefaultCalendar();
+    } catch (e) {
+      return CalendarApp.getDefaultCalendar();
+    }
+  },
+
+  buatEvent: function(detail) {
+    try {
+      var cal = CalendarService.getCalendar();
+      var mulai = Utils.parseTanggalAman(detail.tanggalMulai);
+      var selesai = Utils.parseTanggalAman(detail.tanggalSelesai);
+      if (!mulai || !selesai) throw buatError(ERR.VALIDATION, 'Tanggal tidak valid');
+      var endDate = new Date(selesai.getFullYear(), selesai.getMonth(), selesai.getDate() + 1);
+      var desc = 'No. Pengajuan: ' + detail.no + '\n' +
+                 'NIP: ' + detail.nip + '\n' +
+                 'Unit Kerja: ' + detail.unitKerja + '\n' +
+                 'Jenis Cuti: ' + detail.jenisCuti + '\n' +
+                 'Alasan: ' + (detail.alasan || '-');
+      var event = cal.createAllDayEvent(
+        '🏖️ Cuti: ' + detail.nama + ' (' + detail.jenisCuti + ')',
+        mulai, endDate,
+        {
+          description: desc,
+          location: detail.unitKerja || '',
+          sendInvites: false
+        }
+      );
+      try {
+        Repo.appendRow(CONFIG.SHEETS.CALENDAR, [
+          Utils.generateId(), Utils.formatTimestampDetik(),
+          String(detail.no), event.getId(), 'CREATED'
+        ]);
+      } catch (eS) {}
+      try {
+        var data = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+        for (var i = 0; i < data.length; i++) {
+          if (String(data[i][0]) == String(detail.no)) {
+            Repo.updateCell(CONFIG.SHEETS.DB, i + 2, 22, event.getId());
+            break;
+          }
+        }
+      } catch (eU) {}
+      return { success: true, eventId: event.getId(), message: 'Event calendar berhasil dibuat' };
+    } catch (e) {
+      console.error('CalendarService.buatEvent: ' + e.toString());
+      return { success: false, message: 'Gagal membuat event: ' + e.message };
+    }
+  },
+
+  hapusEvent: function(eventId) {
+    try {
+      if (!eventId) return { success: false, message: 'Event ID kosong' };
+      var cal = CalendarService.getCalendar();
+      var event = cal.getEventById(eventId);
+      if (event) {
+        event.deleteEvent();
+        return { success: true, message: 'Event dihapus' };
+      }
+      return { success: false, message: 'Event tidak ditemukan' };
+    } catch (e) {
+      return { success: false, message: 'Gagal hapus event: ' + e.message };
+    }
+  },
+
+  getCalendarUrl: function() {
+    try {
+      var cal = CalendarService.getCalendar();
+      return 'https://calendar.google.com/calendar/u/0/r?cid=' + encodeURIComponent(cal.getId());
+    } catch (e) {
+      return 'https://calendar.google.com';
+    }
+  }
+};
+
+// ═══ NOTIFICATIONS ═══
+var NotificationService = {
+  kirimEmail: function(to, subjek, htmlBody) {
+    return CircuitBreaker.execute('email', function() {
+      return RetryService.execute(function() {
+        MailApp.sendEmail({ to: to, subject: subjek, htmlBody: htmlBody, name: 'Sistem Cuti ASN - Cabdin Malang' });
+        return { success: true, message: 'OK' };
+      }, 'kirimEmail');
+    });
+  },
+
+  kirimWhatsApp: function(nomor, pesan) {
+    var cfg = getNotifConfig();
+    if (!cfg.fonnteToken) return { success: false, message: 'Token WA belum dikonfigurasi' };
+    return CircuitBreaker.execute('whatsapp', function() {
+      return RetryService.execute(function() {
+        var res = UrlFetchApp.fetch(cfg.fonnteUrl, {
+          method: 'post',
+          headers: { 'Authorization': cfg.fonnteToken },
+          payload: { target: nomor, message: pesan, countryCode: '62' },
+          muteHttpExceptions: true
+        });
+        var j = JSON.parse(res.getContentText());
+        return j.status ? { success: true, message: 'OK' } : { success: false, message: j.reason || 'Gagal' };
+      }, 'kirimWhatsApp');
+    });
+  },
+
+  logNotifikasi: function(noPengajuan, nama, channel, tujuan, sukses, detail) {
+    try {
+      var sh = Repo.getSheet(CONFIG.SHEETS.NOTIF);
+      if (!sh) {
+        sh = Repo.getSpreadsheet().insertSheet(CONFIG.SHEETS.NOTIF);
+        sh.getRange(1, 1, 1, 8).setValues([['No', 'Tanggal', 'No Pengajuan', 'Nama Pemohon', 'Channel', 'Tujuan', 'Status', 'Detail']])
+          .setFontWeight('bold').setBackground('#1e3a5f').setFontColor('#ffffff');
+      }
+      sh.appendRow([
+        Repo.getNextNo(CONFIG.SHEETS.NOTIF), Utils.formatTimestamp(), noPengajuan,
+        nama, channel, tujuan, sukses ? 'Sukses' : 'Gagal', detail || ''
+      ]);
+    } catch (e) { console.error('logNotifikasi: ' + e.toString()); }
+  },
+
+  notifPerubahanStatus: function(data, status, catatan) {
+    var cfg = getNotifConfig(), hasil = { emailTerkirim: false, waTerkirim: false, waLink: '', detail: [] };
+    var pesanWA = NotificationService.buatPesanStatus(data, status, catatan);
+    if (cfg.emailAktif && data.email && Utils.isValidEmail(data.email)) {
+      try {
+        var re = NotificationService.kirimEmail(data.email.trim(), 'Status Pengajuan Cuti No. ' + data.no + ' — ' + status, NotificationService.htmlEmailStatus(data, status, catatan));
+        hasil.emailTerkirim = re.success;
+        NotificationService.logNotifikasi(data.no, data.nama, 'Email', data.email, re.success, re.message);
+      } catch (e) {
+        NotificationService.logNotifikasi(data.no, data.nama, 'Email', data.email, false, e.message);
+      }
+    }
+    var nomor = Utils.normalisasiNomor(data.noHP);
+    if (nomor) {
+      if (cfg.waGateway === 'fonnte' && cfg.fonnteToken) {
+        try {
+          var rw = NotificationService.kirimWhatsApp(nomor, pesanWA);
+          hasil.waTerkirim = rw.success;
+          NotificationService.logNotifikasi(data.no, data.nama, 'WhatsApp', nomor, rw.success, rw.message);
+        } catch (e) {
+          NotificationService.logNotifikasi(data.no, data.nama, 'WhatsApp', nomor, false, e.message);
+        }
+      }
+      if (!hasil.waTerkirim) hasil.waLink = Utils.buatWaLink(nomor, pesanWA);
+    }
+    return hasil;
+  },
+
+  notifPengajuanBaru: function(data) {
+    var cfg = getNotifConfig(), hasil = { emailAdminTerkirim: false, emailPemohonTerkirim: false, waAdminTerkirim: false };
+    try {
+      if (cfg.emailAktif && cfg.emailAdmin && Utils.isValidEmail(cfg.emailAdmin)) {
+        var r1 = NotificationService.kirimEmail(cfg.emailAdmin.trim(), '🔔 Pengajuan Cuti Baru No. ' + data.no + ' — ' + data.nama, NotificationService.htmlEmailPengajuanBaru(data));
+        hasil.emailAdminTerkirim = r1.success;
+        NotificationService.logNotifikasi(data.no, data.nama, 'Email (Admin)', cfg.emailAdmin, r1.success, r1.message);
+      }
+    } catch (e) { console.error('Email admin gagal: ' + e.message); }
+
+    try {
+      if (cfg.emailAktif && data.email && Utils.isValidEmail(data.email)) {
+        var r2 = NotificationService.kirimEmail(data.email.trim(), 'Pengajuan Cuti Anda Telah Diterima (No. ' + data.no + ')', NotificationService.htmlEmailKonfirmasi(data));
+        hasil.emailPemohonTerkirim = r2.success;
+        NotificationService.logNotifikasi(data.no, data.nama, 'Email (Konfirmasi)', data.email, r2.success, r2.message);
+      }
+    } catch (e) { console.error('Email pemohon gagal: ' + e.message); }
+
+    try {
+      var na = Utils.normalisasiNomor(cfg.waAdmin);
+      if (na && cfg.waGateway === 'fonnte' && cfg.fonnteToken) {
+        var r3 = NotificationService.kirimWhatsApp(na, NotificationService.buatPesanPengajuanBaru(data));
+        hasil.waAdminTerkirim = r3.success;
+        NotificationService.logNotifikasi(data.no, data.nama, 'WhatsApp (Admin)', na, r3.success, r3.message);
+      }
+    } catch (e) { console.error('WA admin gagal: ' + e.message); }
+
+    return hasil;
+  },
+
+  notifBerkasVerifikasi: function(data, jenisBerkas, link) {
+    var cfg = getNotifConfig(), hasil = { emailTerkirim: false, waTerkirim: false, waLink: '', detail: [] };
+    var pesanWA = NotificationService.buatPesanBerkas(data, jenisBerkas, link);
+    if (cfg.emailAktif && data.email && Utils.isValidEmail(data.email)) {
+      try {
+        var re = NotificationService.kirimEmail(data.email.trim(), '📎 Berkas Verifikasi Cuti No. ' + data.no + ' — ' + jenisBerkas, NotificationService.htmlEmailBerkas(data, jenisBerkas, link));
+        hasil.emailTerkirim = re.success;
+        NotificationService.logNotifikasi(data.no, data.nama, 'Email (Berkas)', data.email, re.success, re.message);
+      } catch (e) {
+        NotificationService.logNotifikasi(data.no, data.nama, 'Email (Berkas)', data.email, false, e.message);
+      }
+    }
+    var nomor = Utils.normalisasiNomor(data.noHP);
+    if (nomor) {
+      if (cfg.waGateway === 'fonnte' && cfg.fonnteToken) {
+        try {
+          var rw = NotificationService.kirimWhatsApp(nomor, pesanWA);
+          hasil.waTerkirim = rw.success;
+          NotificationService.logNotifikasi(data.no, data.nama, 'WhatsApp (Berkas)', nomor, rw.success, rw.message);
+        } catch (e) {
+          NotificationService.logNotifikasi(data.no, data.nama, 'WhatsApp (Berkas)', nomor, false, e.message);
+        }
+      }
+      if (!hasil.waTerkirim) hasil.waLink = Utils.buatWaLink(nomor, pesanWA);
+    }
+    return hasil;
+  },
+
+  buatPesanStatus: function(data, status, catatan) {
+    var lm = { 'Disetujui': '✅ DISETUJUI', 'Ditolak': '❌ DITOLAK', 'Perlu Revisi': '⚠️ PERLU REVISI', 'Menunggu Verifikasi': '⏳ MENUNGGU' };
+    var p = '*NOTIFIKASI PENGAJUAN CUTI ASN*\n' +
+            'Cabang Dinas Pendidikan Wilayah Malang\n' +
+            '━━━━━━━━━━━━━━━━━━━━\n' +
+            'Kepada Yth. ' + data.nama + '\n' +
+            '📌 No. Pengajuan : ' + data.no + '\n' +
+            '📋 Jenis Cuti : ' + data.jenisCuti + '\n' +
+            '📅 Periode : ' + Utils.fmtTanggal(data.tanggalMulai) + ' s.d. ' + Utils.fmtTanggal(data.tanggalSelesai) + '\n' +
+            'Status: *' + (lm[status] || status) + '*\n';
+    if (catatan) p += '\n📝 Catatan:\n"' + catatan + '"\n';
+    return p + '\n— Sistem Cuti ASN Cabdin Malang';
+  },
+
+  buatPesanPengajuanBaru: function(data) {
+    return '🔔 *PENGAJUAN CUTI BARU*\n' +
+           '━━━━━━━━━━━━━━━━━━━━\n' +
+           '📌 No: ' + data.no + '\n' +
+           '👤 Nama: ' + data.nama + '\n' +
+           '🏫 Unit: ' + data.unitKerja + '\n' +
+           '📋 Jenis: ' + data.jenisCuti + '\n' +
+           '📅 ' + Utils.fmtTanggal(data.tanggalMulai) + ' s.d. ' + Utils.fmtTanggal(data.tanggalSelesai) + ' (' + data.lama + ' hari kerja)\n' +
+           'Mohon segera diverifikasi.\n' +
+           '— Notifikasi Otomatis';
+  },
+
+  buatPesanBerkas: function(data, jenisBerkas, link) {
+    return '📎 *BERKAS VERIFIKASI CUTI*\n' +
+           'Cabang Dinas Pendidikan Wilayah Malang\n' +
+           '━━━━━━━━━━━━━━━━━━━━\n' +
+           'Kepada Yth. ' + data.nama + '\n' +
+           '📌 No. Pengajuan : ' + data.no + '\n' +
+           '📋 Jenis Cuti : ' + data.jenisCuti + '\n' +
+           '🗂️ Berkas : *' + jenisBerkas + '*\n' +
+           '🔗 Unduh/Lihat : ' + link + '\n' +
+           '— Sistem Cuti ASN Cabdin Malang';
+  },
+
+  htmlTabelRincian: function(data) {
+    var rs = 'padding:8px;border-bottom:1px solid #eee;', ls = rs + 'color:#666;width:35%;';
+    return '<table style="width:100%;border-collapse:collapse;margin:15px 0;">' +
+           '<tr><td style="' + ls + '">No. Pengajuan</td><td style="' + rs + '"><strong>' + Utils.escapeHtml(String(data.no)) + '</strong></td></tr>' +
+           '<tr><td style="' + ls + '">Tanggal Pengajuan</td><td style="' + rs + '">' + Utils.fmtTanggal(data.tanggalPengajuan || data.tanggal) + '</td></tr>' +
+           '<tr><td style="' + ls + '">Nama</td><td style="' + rs + '">' + Utils.escapeHtml(data.nama) + '</td></tr>' +
+           '<tr><td style="' + ls + '">Unit Kerja</td><td style="' + rs + '">' + Utils.escapeHtml(data.unitKerja) + '</td></tr>' +
+           '<tr><td style="' + ls + '">Jenis Cuti</td><td style="' + rs + '">' + Utils.escapeHtml(data.jenisCuti) + '</td></tr>' +
+           '<tr><td style="' + ls + '">Periode</td><td style="' + rs + '">' + Utils.fmtTanggal(data.tanggalMulai) + ' s.d. ' + Utils.fmtTanggal(data.tanggalSelesai) + '</td></tr></table>';
+  },
+
+  htmlBungkus: function(isi) {
+    return '<div style="font-family:Segoe UI,Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">' +
+           '<div style="background:linear-gradient(135deg,#1e3a5f,#4a90e2);color:#fff;padding:20px;border-radius:10px 10px 0 0;"><h2 style="margin:0;">📋 Sistem Cuti ASN</h2><p style="margin:5px 0 0;opacity:0.9;">Cabang Dinas Pendidikan Wilayah Malang</p></div>' +
+           '<div style="border:1px solid #e0e0e0;border-top:none;padding:25px;border-radius:0 0 10px 10px;background:#fff;">' + isi +
+           '<p style="color:#888;font-size:12px;margin-top:25px;">Email otomatis. Jangan dibalas.<br>© 2026 Sistem Cuti ASN — Cabdin Malang</p></div></div>';
+  },
+
+  htmlEmailStatus: function(data, status, catatan) {
+    var w = status === 'Disetujui' ? '#10b981' : (status === 'Ditolak' ? '#ef4444' : '#f59e0b');
+    var bg = status === 'Disetujui' ? '#d1fae5' : (status === 'Ditolak' ? '#fee2e2' : '#fef3c7');
+    return NotificationService.htmlBungkus(
+      '<p>Kepada Yth. <strong>' + Utils.escapeHtml(data.nama) + '</strong>,</p><p>Pengajuan cuti Anda telah diproses:</p>' +
+      NotificationService.htmlTabelRincian(data) +
+      '<div style="background:' + bg + ';border-left:4px solid ' + w + ';padding:15px;border-radius:5px;margin:15px 0;"><strong style="color:' + w + ';font-size:16px;">Status: ' + String(status).toUpperCase() + '</strong>' +
+      (catatan ? '<p style="margin:10px 0 0;color:#444;">📝 ' + Utils.escapeHtml(catatan) + '</p>' : '') + '</div>'
+    );
+  },
+
+  htmlEmailPengajuanBaru: function(data) {
+    return NotificationService.htmlBungkus(
+      '<p>🔔 <strong>Ada pengajuan cuti baru:</strong></p>' +
+      NotificationService.htmlTabelRincian(data) +
+      '<div style="background:#e7f1ff;border-left:4px solid #1e3a5f;padding:15px;border-radius:5px;margin:15px 0;">Silakan buka menu <strong>✅ Verifikasi</strong> untuk memproses.</div>'
+    );
+  },
+
+  htmlEmailKonfirmasi: function(data) {
+    return NotificationService.htmlBungkus(
+      '<p>Kepada Yth. <strong>' + Utils.escapeHtml(data.nama) + '</strong>,</p><p>Pengajuan cuti Anda telah <strong>diterima</strong> dan tercatat di database:</p>' +
+      NotificationService.htmlTabelRincian(data) +
+      '<div style="background:#fef3c7;border-left:4px solid #f59e0b;padding:15px;border-radius:5px;margin:15px 0;"><strong style="color:#92400e;">Status: MENUNGGU VERIFIKASI</strong></div>'
+    );
+  },
+
+  htmlEmailBerkas: function(data, jenisBerkas, link) {
+    return NotificationService.htmlBungkus(
+      '<p>Kepada Yth. <strong>' + Utils.escapeHtml(data.nama) + '</strong>,</p><p>Berkas verifikasi pengajuan cuti Anda telah diterbitkan oleh Cabdin:</p>' +
+      NotificationService.htmlTabelRincian(data) +
+      '<div style="background:#e7f1ff;border-left:4px solid #1e3a5f;padding:15px;border-radius:5px;margin:15px 0;"><strong>📎 ' + Utils.escapeHtml(jenisBerkas) + '</strong><br><a href="' + Utils.escapeHtml(link) + '" style="display:inline-block;margin-top:10px;background:linear-gradient(135deg,#1e3a5f,#4a90e2);color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;">📥 Unduh / Lihat Berkas</a></div>'
+    );
+  }
+};
+
+// ═══ CONTROLLERS ═══
+function doGet(e) {
+  try {
+    Repo.inisialisasiDatabase();
+    Repo.ensureSemuaHeader();
+  } catch (err) {
+    console.warn('Inisialisasi ringan doGet: ' + err.toString());
+  }
+  return HtmlService.createTemplateFromFile('Index').evaluate()
+    .setTitle('Sistem Cuti ASN - Cabdin Malang')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0');
+}
+
+function setup() {
+  Repo.inisialisasiDatabase();
+  Repo.ensureSemuaHeader();
+  Repo.ensureTextFormatNip();
+  setupKeamanan();
+  return 'Setup selesai. Semua sheet dan format kolom teks siap digunakan.';
+}
+
+function setupTriggerQueue() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'processNotificationQueue') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('processNotificationQueue').timeBased().everyMinutes(15).create();
+  return '✅ Trigger antrean notifikasi aktif (tiap 15 menit).';
+}
+
+function getHealthStatus() {
+  return ErrorHandler.wrapObject('getHealthStatus', function() {
+    return {
+      status: 'OK',
+      timestamp: new Date().toISOString(),
+      uptime: PerformanceLogger.getStats('doGet'),
+      circuitBreakers: {
+        email: CircuitBreaker.getState('email'),
+        whatsapp: CircuitBreaker.getState('whatsapp')
+      },
+      cache: {
+        enabled: getAppConfig().cacheEnabled,
+        version: getCacheVersion()
+      }
+    };
+  });
+}
+
+function checkLogin(u, p) { return ErrorHandler.wrap('checkLogin', function() { return AuthService.login(u, p); }); }
+function resetPassword(u, pl, pb) { return ErrorHandler.wrap('resetPassword', function() { return AuthService.resetPassword(u, pl, pb); }); }
+function getDaftarSekolah() { return ErrorHandler.wrapArray('getDaftarSekolah', function() { return SekolahService.getDaftar(); }); }
+function getGuruPerSekolah() { return ErrorHandler.wrapObject('getGuruPerSekolah', function() { return GuruService.getPerSekolah(); }); }
+function cariGuruByNip(nip) { return ErrorHandler.wrap('cariGuruByNip', function() { return GuruService.cariByNip(nip); }); }
+function tambahGuru(data) { return ErrorHandler.wrap('tambahGuru', function() { return GuruService.tambah(data); }); }
+function hapusGuru(nip) { return ErrorHandler.wrap('hapusGuru', function() { return GuruService.hapus(nip); }); }
+function mutasiGuru(nip, sb) { return ErrorHandler.wrap('mutasiGuru', function() { return GuruService.mutasi(nip, sb); }); }
+
+function bulkUploadGuru(csvBase64, fileName, actor) {
+  return ErrorHandler.wrap('bulkUploadGuru', function() {
+    ErrorHandler.wajib(csvBase64, 'File CSV');
+    if (!fileName || !/\.csv$/i.test(fileName)) throw buatError(ERR.VALIDATION, 'File harus berformat .csv');
+    var csvText;
+    try {
+      var decoded = Utilities.base64Decode(csvBase64);
+      csvText = Utilities.newBlob(decoded).setDataFromString(null, 'UTF-8').getDataAsString();
+      if (csvText.charCodeAt(0) === 0xFEFF) csvText = csvText.substring(1);
+    } catch (e) {
+      throw buatError(ERR.VALIDATION, 'Gagal membaca file CSV. Pastikan encoding UTF-8.');
+    }
+    return BulkUploadService.process(csvText, actor);
+  });
+}
+
+function downloadTemplateGuru() {
+  return ErrorHandler.wrap('downloadTemplateGuru', function() {
+    var csv = 'NIP,Nama,Jenis Kelamin,Status,Golongan Ruang,Sekolah\n' +
+              '198201182006041001,Ahmad Fauzi,L,PNS,III/d,SMA NEGERI 1 KOTA MALANG\n' +
+              '198505222010012002,Siti Nurhaliza,P,PNS,III/c,SMKN 1 MALANG\n' +
+              '199001152015031003,Budi Santoso,L,PPPK,III/a,SMA NEGERI 2 KOTA MALANG\n';
+    var blob = Utilities.newBlob('\uFEFF' + csv, 'text/csv', 'template_guru.csv');
+    var file = Repo.getRootFolder().createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return { success: true, url: file.getUrl(), name: file.getName() };
+  });
+}
+
+function submitCuti(formData) {
+  return ErrorHandler.wrap('submitCuti', function() {
+    var hasil = CutiService.submit(formData);
+    var notif = { emailAdminTerkirim: false, emailPemohonTerkirim: false, waAdminTerkirim: false };
+    try {
+      notif = NotificationService.notifPengajuanBaru({
+        no: hasil.no,
+        nama: formData.nama,
+        nip: formData.nip,
+        unitKerja: formData.unitKerja,
+        jenisCuti: formData.jenisCuti,
+        tanggalPengajuan: hasil.tanggalPengajuan,
+        tanggalMulai: formData.tanggalMulai,
+        tanggalSelesai: formData.tanggalSelesai,
+        lama: hasil.lama,
+        email: String(formData.email || '').trim(),
+        noHP: formData.noHP,
+        alasan: formData.alasan
+      });
+    } catch (eN) { console.error('Notif gagal: ' + eN.toString()); }
+    return {
+      success: true,
+      message: 'Pengajuan cuti berhasil dikirim! Tanggal pengajuan: ' + hasil.tanggalPengajuan,
+      noPengajuan: hasil.no,
+      tanggalPengajuan: hasil.tanggalPengajuan,
+      notif: notif
+    };
+  });
+}
+
+function getStatistik(f) { return ErrorHandler.wrapObject('getStatistik', function() { return CutiService.getStatistik(f); }); }
+function getRecentPengajuan(f) { return ErrorHandler.wrapArray('getRecentPengajuan', function() { return CutiService.getRecent(f); }); }
+function getAllPengajuan(f) { return ErrorHandler.wrapArray('getAllPengajuan', function() { return CutiService.getAll(f); }); }
+function getDetailPengajuan(no) { return ErrorHandler.wrap('getDetailPengajuan', function() { return { success: true, data: CutiService.getDetail(no) }; }); }
+function getRiwayatStatusPengajuan(no) { return ErrorHandler.wrapArray('getRiwayatStatusPengajuan', function() { return CutiService.getRiwayatStatus(no); }); }
+
+function getDetailVerifikasiLengkap(no) {
+  return ErrorHandler.wrap('getDetailVerifikasiLengkap', function() {
+    var detail = CutiService.getDetail(no);
+    var out = { detail: detail, dokumen: [], kuota: null, warnings: [], riwayat: [] };
+    try { out.dokumen = DokumenService.getByNoPengajuan(no); } catch (e) { out.warnings.push('Dokumen pendukung gagal dimuat: ' + e.message); }
+    if (String(detail.jenisCuti).trim() === CONFIG.CUTI_TAHUNAN && detail.nip) {
+      try {
+        var rs = CutiService.getSisa(detail.nip, detail.tanggalMulaiISO, detail.tanggalSelesaiISO);
+        if (rs.success) out.kuota = rs.data;
+      } catch (e2) { out.warnings.push('Info kuota gagal dimuat: ' + e2.message); }
+    }
+    try { out.riwayat = CutiService.getRiwayatStatus(no); } catch (e3) { out.warnings.push('Riwayat status gagal dimuat: ' + e3.message); }
+    return { success: true, data: out };
+  });
+}
+
+// ═══ PAGINASI VERIFIKASI (DIPERBAIKI: DATA IMMUTABLE, FORMAT TANGGAL AKURAT & INFORMASI PERIODE) ═══
+function getPengajuanPaged(params) {
+  return ErrorHandler.wrap('getPengajuanPaged', function() {
+    params = params || {};
+    var page = Math.max(1, Number(params.page) || 1);
+    var pageSize = Math.min(100, Math.max(5, Number(params.pageSize) || CONFIG.PAGINATION_SIZE));
+    var query = String(params.query || '').toLowerCase().trim();
+    var status = String(params.status || '').trim();
+
+    var allRows = Repo.bacaData(CONFIG.SHEETS.DB, CONFIG.TOTAL_KOLOM_DB);
+    var rows = allRows.filter(function(r) {
+      return String(r[2] || '').trim() !== '' || String(r[3] || '').trim() !== '';
+    });
+
+    var menungguTotal = rows.filter(function(r) {
+      return String(r[14]) === CONFIG.STATUS.MENUNGGU;
+    }).length;
+
+    if (status) {
+      rows = rows.filter(function(r) { return String(r[14]) === status; });
+    }
+    if (query) {
+      rows = rows.filter(function(r) {
+        return String(r[3] || '').toLowerCase().indexOf(query) !== -1 ||
+               String(r[2] || '').toLowerCase().indexOf(query) !== -1;
+      });
+    }
+
+    // Gunakan .slice().reverse() agar tidak memutasi array cache di memori
+    rows = rows.slice().reverse();
+
+    var total = rows.length;
+    var totalPages = Math.max(1, Math.ceil(total / pageSize));
+    if (page > totalPages) page = totalPages;
+    var start = (page - 1) * pageSize;
+
+    return {
+      success: true,
+      data: {
+        rows: rows.slice(start, start + pageSize).map(function(r) {
+          return {
+            no: r[0],
+            tanggalPengajuan: Utils.fmtTanggal(r[1]), // Tanggal Pengajuan Terformat Akurat
+            tanggal: Utils.fmtTanggal(r[1]),          // Kompatibilitas mundur
+            nip: String(r[2] || ''),
+            nama: r[3],
+            unitKerja: r[5],
+            jenisCuti: r[6],
+            tglMulai: Utils.fmtTanggal(r[8]),         // Periode mulai
+            tglSelesai: Utils.fmtTanggal(r[9]),       // Periode selesai
+            lamaCuti: r[10],                          // Durasi hari kerja
+            status: r[14]
+          };
+        }),
+        total: total,
+        page: page,
+        pageSize: pageSize,
+        totalPages: totalPages,
+        menungguTotal: menungguTotal
+      }
+    };
+  });
+}
+
+function updateStatusPengajuan(no, status, catatan, verifikator) {
+  return ErrorHandler.wrap('updateStatusPengajuan', function() {
+    var lock = LockService.getScriptLock();
+    if (!lock.tryLock(CONFIG.LOCK_TIMEOUT_MS)) throw buatError(ERR.RATE_LIMIT, 'Sistem sedang sibuk. Silakan coba lagi dalam beberapa detik.');
+    try {
+      var sebelum = null;
+      try { sebelum = CutiService.getDetail(no); } catch (e) {}
+      if (status === CONFIG.STATUS.DISETUJUI && sebelum && String(sebelum.jenisCuti).trim() === CONFIG.CUTI_TAHUNAN) {
+        var rs = CutiService.getSisa(sebelum.nip, sebelum.tanggalMulaiISO, sebelum.tanggalSelesaiISO);
+        if (rs.success && rs.data.diminta > rs.data.sisa) {
+          throw buatError(ERR.VALIDATION, 'Tidak dapat disetujui: melebihi sisa cuti (diajukan ' + rs.data.diminta + ' / sisa ' + rs.data.sisa + ' hari kerja).');
+        }
+      }
+      var hasil = CutiService.updateStatus(no, status, catatan, verifikator);
+      var calendarEventId = null;
+      if (status === CONFIG.STATUS.DISETUJUI && sebelum) {
+        try {
+          var calRes = CalendarService.buatEvent({
+            no: no,
+            nama: sebelum.nama,
+            nip: sebelum.nip,
+            unitKerja: sebelum.unitKerja,
+            jenisCuti: sebelum.jenisCuti,
+            alasan: sebelum.alasan,
+            tanggalMulai: sebelum.tanggalMulaiISO,
+            tanggalSelesai: sebelum.tanggalSelesaiISO
+          });
+          if (calRes.success) calendarEventId = calRes.eventId;
+        } catch (eC) { console.error('Calendar event gagal: ' + eC.toString()); }
+      }
+      try {
+        Repo.appendRow(CONFIG.SHEETS.AUDIT, [
+          Utils.formatTimestampDetik(), 'updateStatusPengajuan', 'STATUS_CHANGE',
+          'No ' + no + ': ' + (sebelum ? sebelum.status : '?') + ' -> ' + status,
+          String(verifikator || ''), String(catatan || '').substring(0, 500)
+        ]);
+      } catch (eA) {}
+      var notif = { emailTerkirim: false, waTerkirim: false, waLink: '', detail: [] };
+      try {
+        notif = NotificationService.notifPerubahanStatus(hasil.dataPemohon, status, catatan || '');
+      } catch (eN) {
+        console.error('Notif gagal: ' + eN.toString());
+        notif.detail.push('Notifikasi gagal: ' + eN.message);
+        enqueueNotification('STATUS', { noPengajuan: no, status: status, catatan: catatan || '' });
+      }
+      return { success: true, message: 'Status berhasil diperbarui!', oldStatus: hasil.oldStatus, notif: notif, calendarEventId: calendarEventId };
+    } finally {
+      try { lock.releaseLock(); } catch (eL) {}
+    }
+  });
+}
+
+function hapusPengajuanCabin(no, alasan, aktor) {
+  return ErrorHandler.wrap('hapusPengajuanCabin', function() {
+    ErrorHandler.wajib(no, 'No Pengajuan');
+    ErrorHandler.wajib(alasan, 'Alasan penghapusan');
+    var lock = LockService.getScriptLock();
+    if (!lock.tryLock(CONFIG.LOCK_TIMEOUT_MS)) throw buatError(ERR.RATE_LIMIT, 'Sistem sedang sibuk. Coba lagi dalam beberapa detik.');
+    try {
+      var hasil = CutiService.hapus(no, alasan, aktor);
+      try {
+        var cfg = getNotifConfig();
+        if (cfg.emailAktif && cfg.emailAdmin) {
+          var htmlBody = NotificationService.htmlBungkus(
+            '<p>🗑️ <strong>Pengajuan cuti telah dihapus oleh admin:</strong></p>' +
+            '<table style="width:100%;border-collapse:collapse;margin:15px 0;">' +
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;color:#666;width:35%;">No. Pengajuan</td><td style="padding:8px;border-bottom:1px solid #eee;"><strong>' + Utils.escapeHtml(String(no)) + '</strong></td></tr>' +
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;color:#666;">Nama</td><td style="padding:8px;border-bottom:1px solid #eee;">' + Utils.escapeHtml(hasil.data.nama) + '</td></tr>' +
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;color:#666;">NIP</td><td style="padding:8px;border-bottom:1px solid #eee;">' + Utils.escapeHtml(hasil.data.nip) + '</td></tr>' +
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;color:#666;">Unit Kerja</td><td style="padding:8px;border-bottom:1px solid #eee;">' + Utils.escapeHtml(hasil.data.unitKerja) + '</td></tr>' +
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;color:#666;">Jenis Cuti</td><td style="padding:8px;border-bottom:1px solid #eee;">' + Utils.escapeHtml(hasil.data.jenisCuti) + '</td></tr>' +
+            '<tr><td style="padding:8px;border-bottom:1px solid #eee;color:#666;">Dihapus Oleh</td><td style="padding:8px;border-bottom:1px solid #eee;">' + Utils.escapeHtml(String(aktor || 'Admin')) + '</td></tr>' +
+            '</table>' +
+            '<div style="background:#fee2e2;border-left:4px solid #ef4444;padding:15px;border-radius:5px;margin:15px 0;">' +
+            '<strong style="color:#ef4444;">📝 Alasan Penghapusan:</strong>' +
+            '<p style="margin:10px 0 0;color:#444;">' + Utils.escapeHtml(String(alasan)) + '</p></div>' +
+            '<p style="color:#888;font-size:11px;margin-top:15px;"><em>Dokumen pendukung di Drive tetap tersimpan untuk keperluan audit.</em></p>'
+          );
+          NotificationService.kirimEmail(cfg.emailAdmin.trim(), '🗑️ [AUDIT] Pengajuan Cuti No. ' + no + ' Dihapus oleh ' + (aktor || 'Admin'), htmlBody);
+        }
+      } catch (eN) { console.error('Notif hapus gagal: ' + eN.toString()); }
+      return hasil;
+    } finally {
+      try { lock.releaseLock(); } catch (eL) {}
+    }
+  });
+}
+
+function getSisaCutiTahunan(nip, tm, ts) { return ErrorHandler.wrap('getSisaCutiTahunan', function() { return CutiService.getSisa(nip, tm, ts); }); }
+function getDashboardData(fu, role) { return ErrorHandler.wrapObject('getDashboardData', function() { return { statistik: CutiService.getStatistik(fu), recent: CutiService.getRecent(role === 'cabdin' ? null : fu), docStats: DokumenService.getStatistik(fu) }; }); }
+function getLaporanRekap(params) { return ErrorHandler.wrap('getLaporanRekap', function() { return LaporanService.getRekap(params || {}); }); }
+function exportLaporan(params) { return ErrorHandler.wrap('exportLaporan', function() { return LaporanService.exportToSheet(params || {}); }); }
+function getStatistikLengkap(tahun) { return ErrorHandler.wrap('getStatistikLengkap', function() { return LaporanService.getStatistikLengkap(tahun); }); }
+function uploadDokumen(fd) { return ErrorHandler.wrap('uploadDokumen', function() { return DokumenService.upload(fd); }); }
+function uploadDokumenCabdin(fd) { return ErrorHandler.wrap('uploadDokumenCabdin', function() { return DokumenService.uploadCabdin(fd); }); }
+
+function uploadBerkasVerifikasi(fd) {
+  return ErrorHandler.wrap('uploadBerkasVerifikasi', function() {
+    ErrorHandler.wajib(fd.fileData, 'File'); ErrorHandler.wajib(fd.noPengajuan, 'No Pengajuan'); ErrorHandler.wajib(fd.jenisBerkas, 'Jenis Berkas');
+    var v = Utils.validasiFile(fd); if (!v.valid) throw buatError(ERR.VALIDATION, v.message);
+    var lock = LockService.getScriptLock();
+    if (!lock.tryLock(CONFIG.LOCK_TIMEOUT_MS)) throw buatError(ERR.RATE_LIMIT, 'Sistem sedang sibuk. Coba lagi sebentar lagi.');
+    try {
+      var detail = CutiService.getDetail(fd.noPengajuan);
+      var blob = Utilities.newBlob(Utilities.base64Decode(fd.fileData), fd.fileType, Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyyMMdd_HHmmss') + '_' + Utils.sanitizeFilename(fd.fileName));
+      var root = Repo.getRootFolder();
+      var vf = Repo.getOrCreateSubFolder(root, 'Verifikasi_Cabdin');
+      var nf = Repo.getOrCreateSubFolder(vf, 'No_' + fd.noPengajuan);
+      var tf = Repo.getOrCreateSubFolder(nf, Utils.sanitizeFilename(fd.jenisBerkas));
+      var hasil = Repo.simpanFileKeDrive(blob, tf);
+      Repo.appendRow(CONFIG.SHEETS.DOKUMEN, [
+        Repo.getNextNo(CONFIG.SHEETS.DOKUMEN), Utils.formatTimestamp(), detail.nip, detail.nama,
+        detail.unitKerja, fd.jenisBerkas, fd.noPengajuan, String(fd.fileName).trim(),
+        String(fd.fileType).trim(), Utils.formatFileSize(fd.fileSize), hasil.url, 'Berkas Verifikasi Cabdin'
+      ]);
+      try {
+        Repo.appendRow(CONFIG.SHEETS.AUDIT, [
+          Utils.formatTimestampDetik(), 'uploadBerkasVerifikasi', 'UPLOAD',
+          'No ' + fd.noPengajuan + ' | ' + fd.jenisBerkas + ' | ' + fd.fileName, String(fd.fileName), 'OK'
+        ]);
+      } catch (eA) {}
+      var notif = { emailTerkirim: false, waTerkirim: false, waLink: '', detail: [] };
+      try {
+        notif = NotificationService.notifBerkasVerifikasi(detail, fd.jenisBerkas, hasil.url);
+      } catch (eN) {
+        enqueueNotification('BERKAS', { noPengajuan: fd.noPengajuan, jenisBerkas: fd.jenisBerkas, link: hasil.url });
+        notif.detail.push('Notifikasi masuk antrean: ' + eN.message);
+      }
+      return { success: true, message: 'Berkas ' + fd.jenisBerkas + ' berhasil diunggah!', link: hasil.url, notif: notif };
+    } finally {
+      try { lock.releaseLock(); } catch (eL) {}
+    }
+  });
+}
+
+function getDokumenList(fNIP, fUnit) { return ErrorHandler.wrapArray('getDokumenList', function() { return DokumenService.getList(fNIP, fUnit); }); }
+function getDokumenByNoPengajuan(no) { return ErrorHandler.wrapArray('getDokumenByNoPengajuan', function() { return DokumenService.getByNoPengajuan(no); }); }
+function hapusDokumen(no) { return ErrorHandler.wrap('hapusDokumen', function() { return DokumenService.hapus(no); }); }
+function getStatistikDokumen(f) { return ErrorHandler.wrapObject('getStatistikDokumen', function() { return DokumenService.getStatistik(f); }); }
+function getInfoJenisCuti() { return ErrorHandler.wrapArray('getInfoJenisCuti', function() { return InfoCutiService.getJenisCuti(); }); }
+function getDokumenWajibCuti(jc) { return ErrorHandler.wrap('getDokumenWajibCuti', function() { return InfoCutiService.getDokumenWajib(jc); }); }
+
+// ═══ CALENDAR CONTROLLERS ═══
+function getCalendarAdminUrl() {
+  return ErrorHandler.wrap('getCalendarAdminUrl', function() {
+    return { success: true, url: CalendarService.getCalendarUrl() };
+  });
+}
+
+function sinkronisasiCalendar(no) {
+  return ErrorHandler.wrap('sinkronisasiCalendar', function() {
+    ErrorHandler.wajib(no, 'No Pengajuan');
+    var detail = CutiService.getDetail(no);
+    if (detail.status !== CONFIG.STATUS.DISETUJUI) {
+      throw buatError(ERR.VALIDATION, 'Hanya pengajuan yang sudah Disetujui yang dapat disinkronkan ke calendar.');
+    }
+    if (detail.calendarEventId) {
+      try { CalendarService.hapusEvent(detail.calendarEventId); } catch (e) {}
+    }
+    var res = CalendarService.buatEvent({
+      no: no,
+      nama: detail.nama,
+      nip: detail.nip,
+      unitKerja: detail.unitKerja,
+      jenisCuti: detail.jenisCuti,
+      alasan: detail.alasan,
+      tanggalMulai: detail.tanggalMulaiISO,
+      tanggalSelesai: detail.tanggalSelesaiISO
+    });
+    if (!res.success) throw buatError(ERR.SYSTEM, res.message);
+    return { success: true, message: '✅ Event calendar berhasil disinkronkan!', eventId: res.eventId };
+  });
+}
+
+function enqueueNotification(type, payload) {
+  try {
+    Repo.appendRow(CONFIG.SHEETS.QUEUE, [
+      Utils.generateId(), Utils.formatTimestamp(), type, JSON.stringify(payload), 'PENDING', 0, '', ''
+    ]);
+  } catch (e) { console.error('enqueue gagal: ' + e.toString()); }
+}
+
+function processNotificationQueue() {
+  var sh = Repo.getSheet(CONFIG.SHEETS.QUEUE);
+  if (!sh || sh.getLastRow() < 2) return 'Queue kosong';
+  var data = sh.getRange(2, 1, sh.getLastRow() - 1, 8).getValues(), processed = 0;
+  for (var i = 0; i < data.length; i++) {
+    if (String(data[i][4]) === 'PENDING' && Number(data[i][5]) < 3) {
+      var type = String(data[i][2]), payload = {};
+      try { payload = JSON.parse(String(data[i][3])); } catch (e) {}
+      try {
+        if (type === 'BERKAS') {
+          var d1 = CutiService.getDetail(payload.noPengajuan);
+          NotificationService.notifBerkasVerifikasi(d1, payload.jenisBerkas || 'Berkas', payload.link || '');
+        } else if (type === 'STATUS') {
+          var d2 = CutiService.getDetail(payload.noPengajuan);
+          NotificationService.notifPerubahanStatus(d2, payload.status, payload.catatan || '');
+        }
+        sh.getRange(i + 2, 5).setValue('COMPLETED');
+        sh.getRange(i + 2, 8).setValue(Utils.formatTimestamp());
+      } catch (e) {
+        var att = Number(data[i][5]) + 1;
+        sh.getRange(i + 2, 5).setValue(att >= 3 ? 'FAILED' : 'PENDING');
+        sh.getRange(i + 2, 6).setValue(att);
+        sh.getRange(i + 2, 7).setValue(String(e.message || e).substring(0, 500));
+      }
+      processed++;
+    }
+  }
+  return 'Diproses: ' + processed;
+}

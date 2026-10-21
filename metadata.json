@@ -1,0 +1,8 @@
+{
+  "name": "Sistem Cuti ASN - Cabdin Malang",
+  "description": "Sistem Informasi Manajemen & Verifikasi Cuti ASN Cabang Dinas Pendidikan Wilayah Malang - Modern, Transparan, Akurat & Terintegrasi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
